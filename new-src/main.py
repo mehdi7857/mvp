@@ -20,6 +20,8 @@ from src.live_executor import LiveExecutorSkeleton
 # --------------------------------------------------
 # Utils
 # --------------------------------------------------
+# Small helpers for timestamp formatting, safe casting, and picking
+# the most recent record from API history responses.
 
 def now_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
@@ -43,6 +45,8 @@ def parse_latest(history):
 # --------------------------------------------------
 # FUNDING SIGN LOGIC (FIXED)
 # --------------------------------------------------
+# Normalize the funding sign so funding follows premium direction when positive
+# values are reported for both longs and shorts by the upstream API.
 
 def signed_funding(premium: float, fund_raw: float) -> float:
     """
@@ -60,6 +64,8 @@ def signed_funding(premium: float, fund_raw: float) -> float:
 # --------------------------------------------------
 # Data Fetch (hardened)
 # --------------------------------------------------
+# Pull the most recent funding/premium snapshot with a bounded lookback window
+# and simple retry logic to smooth over transient API/network hiccups.
 
 def fetch_latest_snapshot(
     hl: HyperliquidPublic,
@@ -119,6 +125,8 @@ def fetch_latest_snapshot(
 # --------------------------------------------------
 # MAIN
 # --------------------------------------------------
+# Wire together strategy + executors, restore any saved position, then poll all
+# coins, log diagnostics, and hand decisions to the dry-run/live executor pair.
 
 def main() -> None:
     setup_logger()
