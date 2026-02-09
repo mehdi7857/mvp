@@ -1,0 +1,10 @@
+{
+  "position": {
+    "coin": "BTC",
+    "side": "LONG_PERP",
+    "is_open": true,
+    "opened_at_ms": 1770413867116,
+    "size": 0.00125,
+    "entry_px": 68047.0
+  }
+}

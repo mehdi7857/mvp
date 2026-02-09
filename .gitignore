@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual envs
+venv/
+.venv/
+
+# Secrets (do not commit)
+.env
+.venv.json
+env.txt
+
+# Logs / runtime
+logs/
+*.log
+service_err-*.log
+
+# OS
+.DS_Store
