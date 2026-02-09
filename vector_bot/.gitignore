@@ -1,0 +1,25 @@
+.DS_Store
+.ap_test
+
+# env/secrets
+.env
+.env.*
+!.env.example
+env.txt
+
+# virtualenv
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.py[cod]
+
+# logs/runtime
+logs/
+*.log
+
+# tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
