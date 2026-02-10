@@ -138,9 +138,28 @@ def main() -> None:
             return default
         return val.strip().lower() in ("1", "true", "yes", "y", "on")
 
+    def env_float(name: str, default: float) -> float:
+        val = os.getenv(name)
+        if val is None or not str(val).strip():
+            return float(default)
+        try:
+            return float(str(val).strip())
+        except Exception:
+            logger.warning(f"Invalid float env var {name}={val!r}; using default={default}")
+            return float(default)
+
     # Single gate switch
-    ENABLE_LIVE = env_bool("ENABLE_LIVE", default=True)
+    # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
+    ENABLE_LIVE = env_bool("ENABLE_LIVE", default=False)
     live_enabled = ENABLE_LIVE
+
+    # Entry gate (break-even): only enter if expected funding covers round-trip fees with buffer.
+    # IMPORTANT: this is a conservative filter; it prevents fee-churn from bleeding the account.
+    FUNDING_HORIZON_HOURS = env_float("FUNDING_HORIZON_HOURS", 24.0)
+    FEE_RATE_OPEN = env_float("FEE_RATE_OPEN", 0.00045)    # 4.5 bps default (override per your tier)
+    FEE_RATE_CLOSE = env_float("FEE_RATE_CLOSE", 0.00045)  # 4.5 bps default (override per your tier)
+    FUNDING_FEE_MULTIPLE = env_float("FUNDING_FEE_MULTIPLE", 1.5)  # buffer vs estimation error
+    EST_ROUND_TRIP_FEE_RATE = max(0.0, FEE_RATE_OPEN + FEE_RATE_CLOSE)
 
     strat = FundingPremiumStrategy(
         prem_entry=0.00030,
@@ -258,6 +277,22 @@ def main() -> None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
 
                         if d_open.action == "OPEN":
+                            # Break-even gate: funding must cover estimated fees.
+                            expected_funding_usd = abs(b_snap.fundingRate) * executor.notional_usd * FUNDING_HORIZON_HOURS
+                            est_fees_usd = executor.notional_usd * EST_ROUND_TRIP_FEE_RATE
+                            gate_ok = expected_funding_usd >= (FUNDING_FEE_MULTIPLE * est_fees_usd)
+                            logger.info(
+                                f"[GATE] {b_snap.coin} exp_funding_{FUNDING_HORIZON_HOURS:.0f}h=${expected_funding_usd:.6f} "
+                                f"est_round_trip_fees=${est_fees_usd:.6f} mult={FUNDING_FEE_MULTIPLE:.2f} pass={gate_ok}"
+                            )
+                            if not gate_ok:
+                                logger.warning(
+                                    f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | BREAK_EVEN_GATE | "
+                                    f"exp_funding=${expected_funding_usd:.6f} fees=${est_fees_usd:.6f} "
+                                    f"mult={FUNDING_FEE_MULTIPLE:.2f}"
+                                )
+                                continue
+
                             last_trade = last_trade_ms.get(b_snap.coin)
                             if last_trade is not None and (b_snap.time - last_trade) < COOLDOWN_SEC * 1000:
                                 logger.info(
