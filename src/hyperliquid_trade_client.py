@@ -272,6 +272,18 @@ class HyperliquidTradeClient:
         before_pos = self._find_position(before_positions, coin)
         self._log_position("VERIFY_BEFORE", before_pos)
 
+        # For reduce-only CLOSE, always close the full current position size.
+        # Closing by notional can leave residual exposure when price moved.
+        if reduce_only:
+            before_szi = self._safe_float(before_pos.get("szi") if before_pos else 0.0) or 0.0
+            if before_szi == 0.0:
+                raise RuntimeError(f"reduce_only close requested but no open position for coin={coin}")
+            sz = abs(before_szi)
+            sz = math.floor(sz * scale) / scale
+            if sz <= 0:
+                raise RuntimeError(f"Close size too small after rounding | coin={coin} sz={sz}")
+            logger.info(f"CLOSE_FULL_SIZE | coin={coin} before_szi={before_szi} sz={sz}")
+
         cloid = self._make_cloid(client_order_id)
         cloid_txt = str(cloid) if cloid else None
         logger.warning(
