@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
-import yaml
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -13,6 +16,8 @@ class Config:
 
     @staticmethod
     def load(path: str = "config.yaml") -> "Config":
+        if yaml is None:
+            raise RuntimeError("PyYAML is not installed; cannot load YAML config.")
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Config file not found: {p.resolve()}")

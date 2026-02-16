@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -17,6 +18,7 @@ from src.state import load_position, save_position
 from src.models import PositionState
 from src.universe import COINS
 from src.live_executor import LiveExecutor
+from src.config import Config
 
 
 # --------------------------------------------------
@@ -128,9 +130,18 @@ def fetch_latest_snapshot(
 def main() -> None:
     setup_logger()
 
-    POLL_SEC = 10
-    LOOKBACK_HOURS = 24
-    COOLDOWN_SEC = 120
+    cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    cfg: Optional[Config] = None
+    try:
+        cfg = Config.load(str(cfg_path))
+        logger.info(f"CONFIG_LOADED | path={cfg_path}")
+    except Exception as e:
+        logger.warning(f"CONFIG_LOAD_FAILED | path={cfg_path} err={e!r} | using defaults/env")
+
+    def cfg_get(*keys: str, default: Any) -> Any:
+        if cfg is None:
+            return default
+        return cfg.get(*keys, default=default)
 
     def env_bool(name: str, default: bool = False) -> bool:
         val = os.getenv(name)
@@ -148,17 +159,48 @@ def main() -> None:
             logger.warning(f"Invalid float env var {name}={val!r}; using default={default}")
             return float(default)
 
+    def env_int(name: str, default: int) -> int:
+        val = os.getenv(name)
+        if val is None or not str(val).strip():
+            return int(default)
+        try:
+            return int(str(val).strip())
+        except Exception:
+            logger.warning(f"Invalid int env var {name}={val!r}; using default={default}")
+            return int(default)
+
+    POLL_SEC = env_int("POLL_SEC", int(cfg_get("runtime", "POLL_SEC", default=10)))
+    LOOKBACK_HOURS = env_int("LOOKBACK_HOURS", int(cfg_get("runtime", "LOOKBACK_HOURS", default=24)))
+    COOLDOWN_SEC = env_int(
+        "ENTRY_COOLDOWN_SEC",
+        int(cfg_get("cooldowns", "ENTRY_COOLDOWN_SEC", default=120)),
+    )
+
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
-    ENABLE_LIVE = env_bool("ENABLE_LIVE", default=False)
+    ENABLE_LIVE = env_bool("ENABLE_LIVE", default=bool(cfg_get("runtime", "ENABLE_LIVE", default=0)))
     live_enabled = ENABLE_LIVE
 
     # Entry gate (break-even): only enter if expected funding covers round-trip fees with buffer.
     # IMPORTANT: this is a conservative filter; it prevents fee-churn from bleeding the account.
-    FUNDING_HORIZON_HOURS = env_float("FUNDING_HORIZON_HOURS", 24.0)
-    FEE_RATE_OPEN = env_float("FEE_RATE_OPEN", 0.00045)    # 4.5 bps default (override per your tier)
-    FEE_RATE_CLOSE = env_float("FEE_RATE_CLOSE", 0.00045)  # 4.5 bps default (override per your tier)
-    FUNDING_FEE_MULTIPLE = env_float("FUNDING_FEE_MULTIPLE", 1.5)  # buffer vs estimation error
+    FUNDING_HORIZON_HOURS = env_float(
+        "FUNDING_HORIZON_HOURS",
+        float(cfg_get("funding_gate", "FUNDING_HORIZON_HOURS", default=24.0)),
+    )
+    FEE_RATE_OPEN = env_float(
+        "FEE_RATE_OPEN",
+        float(cfg_get("funding_gate", "FEE_RATE_OPEN", default=0.00045)),
+    )
+    FEE_RATE_CLOSE = env_float(
+        "FEE_RATE_CLOSE",
+        float(cfg_get("funding_gate", "FEE_RATE_CLOSE", default=0.00045)),
+    )
+    funding_edge_default = float(cfg_get("funding_gate", "FUNDING_EDGE_MULTIPLIER", default=2.0))
+    if os.getenv("FUNDING_EDGE_MULTIPLIER") is not None:
+        FUNDING_FEE_MULTIPLE = env_float("FUNDING_EDGE_MULTIPLIER", funding_edge_default)
+    else:
+        # Backward-compat with old env var name used in previous version.
+        FUNDING_FEE_MULTIPLE = env_float("FUNDING_FEE_MULTIPLE", funding_edge_default)
     EST_ROUND_TRIP_FEE_RATE = max(0.0, FEE_RATE_OPEN + FEE_RATE_CLOSE)
 
     strat = FundingPremiumStrategy(
@@ -168,7 +210,21 @@ def main() -> None:
         fund_exit=0.000005,
     )
 
-    executor = DryRunExecutor(notional_usd=100.0)
+    base_notional_usd = env_float(
+        "BASE_NOTIONAL_X_USD",
+        float(cfg_get("sizing", "BASE_NOTIONAL_X_USD", default=100.0)),
+    )
+    executor = DryRunExecutor(notional_usd=base_notional_usd)
+
+    logger.info(
+        "EFFECTIVE_CONFIG | "
+        f"ENABLE_LIVE={ENABLE_LIVE} "
+        f"POLL_SEC={POLL_SEC} LOOKBACK_HOURS={LOOKBACK_HOURS} ENTRY_COOLDOWN_SEC={COOLDOWN_SEC} "
+        f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
+        f"FUNDING_HORIZON_HOURS={FUNDING_HORIZON_HOURS:.2f} "
+        f"FEE_RATE_OPEN={FEE_RATE_OPEN:.6f} FEE_RATE_CLOSE={FEE_RATE_CLOSE:.6f} "
+        f"FUNDING_EDGE_MULTIPLIER={FUNDING_FEE_MULTIPLE:.3f}"
+    )
 
     # LiveExecutor: safe_mode flips based on ENABLE_LIVE
     live = LiveExecutor(
