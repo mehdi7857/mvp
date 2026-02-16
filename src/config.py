@@ -1,7 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict
 
+import yaml
+
+
+@dataclass(frozen=True)
+class Config:
+    raw: Dict[str, Any]
+
+    @staticmethod
+    def load(path: str = "config.yaml") -> "Config":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"Config root must be a mapping, got: {type(data).__name__}")
+        return Config(raw=data)
+
+    def get(self, *keys: str, default: Any = None) -> Any:
+        d: Any = self.raw
+        for k in keys:
+            if not isinstance(d, dict) or k not in d:
+                return default
+            d = d[k]
+        return d
 
 @dataclass(frozen=True)
 class BotConfig:
