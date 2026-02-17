@@ -42,6 +42,12 @@ def parse_latest(history):
     return max(history, key=lambda x: int(x.get("time", 0)))
 
 
+def is_retryable_http_status(code: Optional[int]) -> bool:
+    if code is None:
+        return False
+    return code == 429 or 500 <= code <= 599
+
+
 # --------------------------------------------------
 # FUNDING SIGN LOGIC (FIXED)
 # --------------------------------------------------
@@ -67,6 +73,8 @@ def fetch_latest_snapshot(
     coin: str,
     lookback_hours: int,
     max_retries: int = 3,
+    backoff_base_seconds: float = 0.5,
+    backoff_max_seconds: float = 5.0,
 ) -> Tuple[Optional[Snapshot], Optional[Dict[str, Any]]]:
 
     end_ms = int(time.time() * 1000)
@@ -103,14 +111,29 @@ def fetch_latest_snapshot(
             httpx.ConnectTimeout,
             httpx.ConnectError,
             httpx.RemoteProtocolError,
+            httpx.NetworkError,
+            httpx.PoolTimeout,
         ) as e:
             last_err = e
-            sleep_s = 0.5 * attempt
+            sleep_s = min(backoff_max_seconds, backoff_base_seconds * (2 ** (attempt - 1)))
             logger.warning(
                 f"API transient error | coin={coin} attempt={attempt}/{max_retries} "
                 f"err={type(e).__name__} | sleeping={sleep_s:.1f}s"
             )
             time.sleep(sleep_s)
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            code = e.response.status_code if e.response is not None else None
+            if is_retryable_http_status(code):
+                sleep_s = min(backoff_max_seconds, backoff_base_seconds * (2 ** (attempt - 1)))
+                logger.warning(
+                    f"API transient status | coin={coin} code={code} "
+                    f"attempt={attempt}/{max_retries} | sleeping={sleep_s:.1f}s"
+                )
+                time.sleep(sleep_s)
+                continue
+            logger.error(f"API non-retryable status | coin={coin} code={code}")
+            return None, None
 
         except Exception as e:
             last_err = e
@@ -171,9 +194,48 @@ def main() -> None:
 
     POLL_SEC = env_int("POLL_SEC", int(cfg_get("runtime", "POLL_SEC", default=10)))
     LOOKBACK_HOURS = env_int("LOOKBACK_HOURS", int(cfg_get("runtime", "LOOKBACK_HOURS", default=24)))
+    REQUEST_TIMEOUT_SECONDS = env_float(
+        "REQUEST_TIMEOUT_SECONDS",
+        float(cfg_get("networking", "REQUEST_TIMEOUT_SECONDS", default=10.0)),
+    )
+    FETCH_RETRY_ATTEMPTS = max(
+        1,
+        env_int(
+            "FETCH_RETRY_ATTEMPTS",
+            int(cfg_get("networking", "FETCH_RETRY_ATTEMPTS", default=3)),
+        ),
+    )
+    FETCH_BACKOFF_BASE_SECONDS = max(
+        0.1,
+        env_float(
+            "FETCH_BACKOFF_BASE_SECONDS",
+            float(cfg_get("networking", "FETCH_BACKOFF_BASE_SECONDS", default=0.5)),
+        ),
+    )
+    FETCH_BACKOFF_MAX_SECONDS = max(
+        FETCH_BACKOFF_BASE_SECONDS,
+        env_float(
+            "FETCH_BACKOFF_MAX_SECONDS",
+            float(cfg_get("networking", "FETCH_BACKOFF_MAX_SECONDS", default=5.0)),
+        ),
+    )
     COOLDOWN_SEC = env_int(
         "ENTRY_COOLDOWN_SEC",
         int(cfg_get("cooldowns", "ENTRY_COOLDOWN_SEC", default=120)),
+    )
+    ALERT_CONSECUTIVE_EMPTY_CYCLES = max(
+        1,
+        env_int(
+            "ALERT_CONSECUTIVE_EMPTY_CYCLES",
+            int(cfg_get("alerts", "CONSECUTIVE_EMPTY_CYCLES", default=3)),
+        ),
+    )
+    ALERT_EMPTY_CYCLE_COOLDOWN_SEC = max(
+        30,
+        env_int(
+            "ALERT_EMPTY_CYCLE_COOLDOWN_SEC",
+            int(cfg_get("alerts", "EMPTY_CYCLE_COOLDOWN_SEC", default=300)),
+        ),
     )
 
     # Single gate switch
@@ -220,6 +282,12 @@ def main() -> None:
         "EFFECTIVE_CONFIG | "
         f"ENABLE_LIVE={ENABLE_LIVE} "
         f"POLL_SEC={POLL_SEC} LOOKBACK_HOURS={LOOKBACK_HOURS} ENTRY_COOLDOWN_SEC={COOLDOWN_SEC} "
+        f"REQUEST_TIMEOUT_SECONDS={REQUEST_TIMEOUT_SECONDS:.1f} "
+        f"FETCH_RETRY_ATTEMPTS={FETCH_RETRY_ATTEMPTS} "
+        f"FETCH_BACKOFF_BASE_SECONDS={FETCH_BACKOFF_BASE_SECONDS:.1f} "
+        f"FETCH_BACKOFF_MAX_SECONDS={FETCH_BACKOFF_MAX_SECONDS:.1f} "
+        f"ALERT_CONSECUTIVE_EMPTY_CYCLES={ALERT_CONSECUTIVE_EMPTY_CYCLES} "
+        f"ALERT_EMPTY_CYCLE_COOLDOWN_SEC={ALERT_EMPTY_CYCLE_COOLDOWN_SEC} "
         f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
         f"FUNDING_HORIZON_HOURS={FUNDING_HORIZON_HOURS:.2f} "
         f"FEE_RATE_OPEN={FEE_RATE_OPEN:.6f} FEE_RATE_CLOSE={FEE_RATE_CLOSE:.6f} "
@@ -276,7 +344,7 @@ def main() -> None:
     else:
         logger.info("LIVE_DISABLED | skipping exchange state sync (no private key required)")
 
-    hl = HyperliquidPublic()
+    hl = HyperliquidPublic(timeout=REQUEST_TIMEOUT_SECONDS)
 
     logger.info(
         f"Starting MULTI-COIN bot | coins={COINS} poll={POLL_SEC}s lookback={LOOKBACK_HOURS}h | ENABLE_LIVE={ENABLE_LIVE}"
@@ -286,6 +354,8 @@ def main() -> None:
     last_trade_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
     fail_counts: Dict[str, int] = {}
     last_fail_log_ms: Optional[int] = None
+    consecutive_empty_cycles = 0
+    last_empty_alert_ms: Optional[int] = None
 
     try:
         while True:
@@ -293,14 +363,37 @@ def main() -> None:
 
             # ---------- FETCH ----------
             for coin in COINS:
-                snap, raw = fetch_latest_snapshot(hl, coin, LOOKBACK_HOURS)
+                snap, raw = fetch_latest_snapshot(
+                    hl,
+                    coin,
+                    LOOKBACK_HOURS,
+                    max_retries=FETCH_RETRY_ATTEMPTS,
+                    backoff_base_seconds=FETCH_BACKOFF_BASE_SECONDS,
+                    backoff_max_seconds=FETCH_BACKOFF_MAX_SECONDS,
+                )
                 if snap is not None and raw is not None:
                     snapshots.append((snap, raw))
 
             if not snapshots:
-                logger.warning("No snapshots fetched this cycle")
+                consecutive_empty_cycles += 1
+                logger.warning(f"No snapshots fetched this cycle | consecutive={consecutive_empty_cycles}")
+                now_ms = int(time.time() * 1000)
+                if consecutive_empty_cycles >= ALERT_CONSECUTIVE_EMPTY_CYCLES:
+                    should_alert = (
+                        last_empty_alert_ms is None
+                        or (now_ms - last_empty_alert_ms) >= ALERT_EMPTY_CYCLE_COOLDOWN_SEC * 1000
+                    )
+                    if should_alert:
+                        logger.error(
+                            "ALERT_SNAPSHOT_STALL | "
+                            f"consecutive_empty_cycles={consecutive_empty_cycles} "
+                            f"threshold={ALERT_CONSECUTIVE_EMPTY_CYCLES} "
+                            f"poll_sec={POLL_SEC} retries={FETCH_RETRY_ATTEMPTS}"
+                        )
+                        last_empty_alert_ms = now_ms
                 time.sleep(POLL_SEC)
                 continue
+            consecutive_empty_cycles = 0
 
             # ---------- PROCESS ----------
             for b_snap, raw in snapshots:
