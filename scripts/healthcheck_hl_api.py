@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import List
 
 import httpx
+
+# Allow running this script directly from the repo root or scripts folder.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.exchanges import HyperliquidPublic
 
