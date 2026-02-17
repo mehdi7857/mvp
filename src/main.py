@@ -265,11 +265,16 @@ def main() -> None:
         FUNDING_FEE_MULTIPLE = env_float("FUNDING_FEE_MULTIPLE", funding_edge_default)
     EST_ROUND_TRIP_FEE_RATE = max(0.0, FEE_RATE_OPEN + FEE_RATE_CLOSE)
 
+    PREM_ENTRY = env_float("PREM_ENTRY", float(cfg_get("strategy", "PREM_ENTRY", default=0.00030)))
+    FUND_ENTRY = env_float("FUND_ENTRY", float(cfg_get("strategy", "FUND_ENTRY", default=0.000006)))
+    PREM_EXIT = env_float("PREM_EXIT", float(cfg_get("strategy", "PREM_EXIT", default=0.00020)))
+    FUND_EXIT = env_float("FUND_EXIT", float(cfg_get("strategy", "FUND_EXIT", default=0.000005)))
+
     strat = FundingPremiumStrategy(
-        prem_entry=0.00030,
-        fund_entry=0.000006,
-        prem_exit=0.00020,
-        fund_exit=0.000005,
+        prem_entry=PREM_ENTRY,
+        fund_entry=FUND_ENTRY,
+        prem_exit=PREM_EXIT,
+        fund_exit=FUND_EXIT,
     )
 
     base_notional_usd = env_float(
@@ -288,6 +293,8 @@ def main() -> None:
         f"FETCH_BACKOFF_MAX_SECONDS={FETCH_BACKOFF_MAX_SECONDS:.1f} "
         f"ALERT_CONSECUTIVE_EMPTY_CYCLES={ALERT_CONSECUTIVE_EMPTY_CYCLES} "
         f"ALERT_EMPTY_CYCLE_COOLDOWN_SEC={ALERT_EMPTY_CYCLE_COOLDOWN_SEC} "
+        f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
+        f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
         f"FUNDING_HORIZON_HOURS={FUNDING_HORIZON_HOURS:.2f} "
         f"FEE_RATE_OPEN={FEE_RATE_OPEN:.6f} FEE_RATE_CLOSE={FEE_RATE_CLOSE:.6f} "
