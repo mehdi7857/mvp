@@ -10,6 +10,10 @@ from src.hl_keys import bootstrap_hl_env
 
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+_TOKEN_ALIASES: Dict[str, List[str]] = {
+    "BTC": ["BTC", "UBTC", "WBTC"],
+    "ETH": ["ETH", "WETH"],
+}
 
 
 def _safe_upper(x: Any) -> str:
@@ -21,6 +25,21 @@ def _try_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _token_matches(target: str, actual: str) -> bool:
+    t = _safe_upper(target)
+    a = _safe_upper(actual)
+    if not t or not a:
+        return False
+    if a == t:
+        return True
+    for alias in _TOKEN_ALIASES.get(t, []):
+        if a == alias:
+            return True
+    if a in (f"U{t}", f"W{t}"):
+        return True
+    return False
 
 
 def _call_info(payload: Dict[str, Any], timeout: float) -> Any:
@@ -68,7 +87,12 @@ def _find_spot_pair_candidates(spot_meta: Any, base: str, quote: str) -> List[st
         if not isinstance(u, dict):
             continue
         nm = _safe_upper(u.get("name") or u.get("coin") or u.get("symbol"))
-        if base_u in nm and quote_u in nm:
+        if quote_u in nm and (
+            base_u in nm
+            or any(alias in nm for alias in _TOKEN_ALIASES.get(base_u, []))
+            or f"U{base_u}" in nm
+            or f"W{base_u}" in nm
+        ):
             out.append(nm)
             continue
 
@@ -83,7 +107,7 @@ def _find_spot_pair_candidates(spot_meta: Any, base: str, quote: str) -> List[st
                     idx = None
                 if idx is not None and idx in token_names:
                     names.append(token_names[idx])
-            if base_u in names and quote_u in names:
+            if quote_u in names and any(_token_matches(base_u, n) for n in names):
                 out.append(f"{base_u}/{quote_u} (tokens={names})")
 
     if not out:

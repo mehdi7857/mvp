@@ -11,6 +11,28 @@ from eth_account import Account
 from src.hl_keys import get_hl_private_key
 
 
+_TOKEN_ALIASES: Dict[str, List[str]] = {
+    "BTC": ["BTC", "UBTC", "WBTC"],
+    "ETH": ["ETH", "WETH"],
+}
+
+
+def _token_matches(target: str, actual: str) -> bool:
+    t = str(target or "").upper().strip()
+    a = str(actual or "").upper().strip()
+    if not t or not a:
+        return False
+    if a == t:
+        return True
+    for alias in _TOKEN_ALIASES.get(t, []):
+        if a == alias:
+            return True
+    # Generic wrapper prefixes often used on spot symbols.
+    if a in (f"U{t}", f"W{t}"):
+        return True
+    return False
+
+
 def _resolve_hyperliquid_classes():
     try:
         from hyperliquid.info import Info
@@ -127,6 +149,15 @@ class HyperliquidTradeClient:
         candidates = [f"{base}/{quote}", f"{base}:{quote}", f"{quote}/{base}"]
         for name in candidates:
             if name in self.info.name_to_coin:
+                return name
+        # Fuzzy resolution for wrapped aliases (e.g. UBTC/WBTC for BTC).
+        for name in self.info.name_to_coin.keys():
+            if "/" not in name:
+                continue
+            b, q = name.split("/", 1)
+            if q.upper().strip() != quote:
+                continue
+            if _token_matches(base, b):
                 return name
         raise RuntimeError(
             f"Spot pair not found for {base}/{quote}. "
