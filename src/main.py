@@ -48,6 +48,17 @@ def is_retryable_http_status(code: Optional[int]) -> bool:
     return code == 429 or 500 <= code <= 599
 
 
+def calc_expected_funding_and_fees(
+    funding_rate: float,
+    notional_usd: float,
+    horizon_hours: float,
+    round_trip_fee_rate: float,
+) -> Tuple[float, float]:
+    expected_funding_usd = abs(funding_rate) * notional_usd * horizon_hours
+    est_fees_usd = notional_usd * round_trip_fee_rate
+    return expected_funding_usd, est_fees_usd
+
+
 # --------------------------------------------------
 # FUNDING SIGN LOGIC (FIXED)
 # --------------------------------------------------
@@ -237,6 +248,20 @@ def main() -> None:
             int(cfg_get("alerts", "EMPTY_CYCLE_COOLDOWN_SEC", default=300)),
         ),
     )
+    ALERT_MISSED_OPEN_OPP_CYCLES = max(
+        1,
+        env_int(
+            "ALERT_MISSED_OPEN_OPP_CYCLES",
+            int(cfg_get("alerts", "MISSED_OPEN_OPP_CYCLES", default=2)),
+        ),
+    )
+    ALERT_MISSED_OPEN_COOLDOWN_SEC = max(
+        30,
+        env_int(
+            "ALERT_MISSED_OPEN_COOLDOWN_SEC",
+            int(cfg_get("alerts", "MISSED_OPEN_COOLDOWN_SEC", default=180)),
+        ),
+    )
 
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
@@ -293,6 +318,8 @@ def main() -> None:
         f"FETCH_BACKOFF_MAX_SECONDS={FETCH_BACKOFF_MAX_SECONDS:.1f} "
         f"ALERT_CONSECUTIVE_EMPTY_CYCLES={ALERT_CONSECUTIVE_EMPTY_CYCLES} "
         f"ALERT_EMPTY_CYCLE_COOLDOWN_SEC={ALERT_EMPTY_CYCLE_COOLDOWN_SEC} "
+        f"ALERT_MISSED_OPEN_OPP_CYCLES={ALERT_MISSED_OPEN_OPP_CYCLES} "
+        f"ALERT_MISSED_OPEN_COOLDOWN_SEC={ALERT_MISSED_OPEN_COOLDOWN_SEC} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
@@ -353,6 +380,35 @@ def main() -> None:
 
     hl = HyperliquidPublic(timeout=REQUEST_TIMEOUT_SECONDS)
 
+    # One-shot pre-start check: market suitability before bot loop.
+    for coin in COINS:
+        pre_snap, _ = fetch_latest_snapshot(
+            hl,
+            coin,
+            LOOKBACK_HOURS,
+            max_retries=FETCH_RETRY_ATTEMPTS,
+            backoff_base_seconds=FETCH_BACKOFF_BASE_SECONDS,
+            backoff_max_seconds=FETCH_BACKOFF_MAX_SECONDS,
+        )
+        if pre_snap is None:
+            logger.warning(f"PRESTART_MARKET_CHECK | coin={coin} status=no_data")
+            continue
+        pre_decision = strat.decide_open(pre_snap)
+        pre_expected_funding_usd, pre_est_fees_usd = calc_expected_funding_and_fees(
+            pre_snap.fundingRate,
+            executor.notional_usd,
+            FUNDING_HORIZON_HOURS,
+            EST_ROUND_TRIP_FEE_RATE,
+        )
+        pre_gate_ok = pre_expected_funding_usd >= (FUNDING_FEE_MULTIPLE * pre_est_fees_usd)
+        pre_candidate = pre_decision.action == "OPEN" and pre_gate_ok
+        logger.info(
+            "PRESTART_MARKET_CHECK | "
+            f"coin={coin} action={pre_decision.action} reason={pre_decision.reason} "
+            f"premium={pre_snap.premium:+.6f} funding={pre_snap.fundingRate:+.6f} "
+            f"gate_pass={pre_gate_ok} market_open_candidate={pre_candidate}"
+        )
+
     logger.info(
         f"Starting MULTI-COIN bot | coins={COINS} poll={POLL_SEC}s lookback={LOOKBACK_HOURS}h | ENABLE_LIVE={ENABLE_LIVE}"
     )
@@ -363,6 +419,8 @@ def main() -> None:
     last_fail_log_ms: Optional[int] = None
     consecutive_empty_cycles = 0
     last_empty_alert_ms: Optional[int] = None
+    missed_open_opportunity_cycles: Dict[str, int] = {c: 0 for c in COINS}
+    last_missed_open_alert_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
 
     try:
         while True:
@@ -434,14 +492,19 @@ def main() -> None:
 
                         if d_open.action == "OPEN":
                             # Break-even gate: funding must cover estimated fees.
-                            expected_funding_usd = abs(b_snap.fundingRate) * executor.notional_usd * FUNDING_HORIZON_HOURS
-                            est_fees_usd = executor.notional_usd * EST_ROUND_TRIP_FEE_RATE
+                            expected_funding_usd, est_fees_usd = calc_expected_funding_and_fees(
+                                b_snap.fundingRate,
+                                executor.notional_usd,
+                                FUNDING_HORIZON_HOURS,
+                                EST_ROUND_TRIP_FEE_RATE,
+                            )
                             gate_ok = expected_funding_usd >= (FUNDING_FEE_MULTIPLE * est_fees_usd)
                             logger.info(
                                 f"[GATE] {b_snap.coin} exp_funding_{FUNDING_HORIZON_HOURS:.0f}h=${expected_funding_usd:.6f} "
                                 f"est_round_trip_fees=${est_fees_usd:.6f} mult={FUNDING_FEE_MULTIPLE:.2f} pass={gate_ok}"
                             )
                             if not gate_ok:
+                                missed_open_opportunity_cycles[b_snap.coin] = 0
                                 logger.warning(
                                     f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | BREAK_EVEN_GATE | "
                                     f"exp_funding=${expected_funding_usd:.6f} fees=${est_fees_usd:.6f} "
@@ -450,12 +513,16 @@ def main() -> None:
                                 continue
 
                             last_trade = last_trade_ms.get(b_snap.coin)
-                            if last_trade is not None and (b_snap.time - last_trade) < COOLDOWN_SEC * 1000:
+                            cooldown_active = last_trade is not None and (b_snap.time - last_trade) < COOLDOWN_SEC * 1000
+                            if cooldown_active:
+                                missed_open_opportunity_cycles[b_snap.coin] = 0
                                 logger.info(
                                     f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | COOLDOWN_ACTIVE | "
                                     f"cooldown_sec={COOLDOWN_SEC}"
                                 )
                                 continue
+
+                            missed_open_opportunity_cycles[b_snap.coin] += 1
                             plan = live.preview(b_snap, "OPEN", d_open.side, d_open.reason)
 
                             if live_enabled:
@@ -466,15 +533,35 @@ def main() -> None:
                                         f"ok={getattr(result, 'ok', None)} verified={getattr(result, 'verified', None)} "
                                         f"reason={getattr(result, 'verify_reason', None)}"
                                     )
+                                    now_ms = int(time.time() * 1000)
+                                    should_alert = (
+                                        missed_open_opportunity_cycles[b_snap.coin] >= ALERT_MISSED_OPEN_OPP_CYCLES
+                                        and (
+                                            last_missed_open_alert_ms[b_snap.coin] is None
+                                            or (now_ms - (last_missed_open_alert_ms[b_snap.coin] or 0))
+                                            >= ALERT_MISSED_OPEN_COOLDOWN_SEC * 1000
+                                        )
+                                    )
+                                    if should_alert:
+                                        logger.error(
+                                            "ALERT_MISSED_OPEN_WHEN_MARKET_OK | "
+                                            f"coin={b_snap.coin} cycles={missed_open_opportunity_cycles[b_snap.coin]} "
+                                            f"reason={d_open.reason} gate_pass={gate_ok} cooldown_active={cooldown_active} "
+                                            f"live_enabled={live_enabled}"
+                                        )
+                                        last_missed_open_alert_ms[b_snap.coin] = now_ms
                                     live_enabled = False
                                     logger.error("EXECUTION_DESYNC_ABORT | live trading disabled until restart")
                                     continue
                                 last_trade_ms[b_snap.coin] = b_snap.time
 
                             status = executor.on_decision(b_snap, d_open)
+                            if status.startswith("OPENED"):
+                                missed_open_opportunity_cycles[b_snap.coin] = 0
                             logger.info(f"[{now_iso(b_snap.time)}] [{b_snap.coin}] OPEN | {status}")
 
                         else:
+                            missed_open_opportunity_cycles[b_snap.coin] = 0
                             prem_abs = abs(b_snap.premium)
                             fund_abs = abs(b_snap.fundingRate)
 
