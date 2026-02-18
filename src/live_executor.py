@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional, Any
 
 from loguru import logger
@@ -35,27 +36,30 @@ class OrderPlan:
 
 
 # --------------------------------------------------
-# Live Executor (PERP-ONLY)
+# Live Executor (PERP + SPOT hedge)
 # --------------------------------------------------
 
 class LiveExecutor:
     """
-    PERP-ONLY executor.
+    Hedge executor.
     safe_mode=True  => plan only (no real orders)
-    safe_mode=False => real orders sent via client.place_perp_order(...)
+    safe_mode=False => real orders sent via client.place_perp_order(...) + place_spot_order(...)
     """
 
-    def __init__(self, notional_usd: float, safe_mode: bool = True) -> None:
+    def __init__(self, notional_usd: float, safe_mode: bool = True, spot_quote: str = "USDC") -> None:
         # 3.2) HARD CAP (you requested)
         assert notional_usd <= 100.0, "Real-money test cap exceeded"
 
         self.notional_usd = float(notional_usd)
         self.safe_mode = bool(safe_mode)
+        self.spot_quote = str(spot_quote).upper().strip()
 
         self.client = None
+        self.supports_spot_hedge = False
 
         logger.info(
-            f"LiveExecutor initialized | PERP_ONLY | notional=${self.notional_usd:.2f} | safe_mode={self.safe_mode}"
+            f"LiveExecutor initialized | HEDGE_MODE(perp+spot) | notional=${self.notional_usd:.2f} "
+            f"| spot_quote={self.spot_quote} | safe_mode={self.safe_mode}"
         )
 
     # -------------------------
@@ -150,11 +154,19 @@ class LiveExecutor:
     def ensure_client(self) -> None:
         self._ensure_client()
 
-    # 3.4) EXECUTE PERP ORDER
+    def spot_hedge_capability(self, coin: str) -> bool:
+        self._ensure_client()
+        supports = bool(getattr(self.client, "supports_spot", False)) and bool(  # type: ignore[union-attr]
+            self.client.can_trade_spot_pair(coin, self.spot_quote)  # type: ignore[union-attr]
+        )
+        self.supports_spot_hedge = supports
+        return supports
+
+    # 3.4) EXECUTE HEDGED ORDER
     def execute(self, plan: OrderPlan) -> Optional[Any]:
         """
         Sends real orders only if safe_mode=False.
-        Uses self.client.place_perp_order(...)
+        Uses self.client.place_perp_order(...) and self.client.place_spot_order(...).
 
         plan.side:
           - LONG_PERP  => OPEN: BUY  / CLOSE: SELL
@@ -166,25 +178,81 @@ class LiveExecutor:
 
         self._ensure_client()
         if plan.kind == "OPEN":
-            side = "BUY" if plan.side in ("LONG_PERP", "LONG_PERP_SHORT_SPOT") else "SELL"
-            logger.warning(
-                f"LIVE ORDER SENT | OPEN {plan.coin} {side} ${plan.notional_usd:.2f} reduce_only=False"
-            )
-            return self.client.place_perp_order(  # type: ignore[union-attr]
-                coin=plan.coin,
-                side=side,
-                notional_usd=plan.notional_usd,
-                reduce_only=False,
+            if plan.side in ("SHORT_PERP", "SHORT_PERP_LONG_SPOT"):
+                # For funding>0 carry: open spot long first, then perp short.
+                spot = self.client.place_spot_order(  # type: ignore[union-attr]
+                    base_coin=plan.coin,
+                    quote_coin=self.spot_quote,
+                    side="BUY",
+                    notional_usd=plan.notional_usd,
+                )
+                if not getattr(spot, "ok", False):
+                    return SimpleNamespace(ok=False, verified=False, verify_reason="spot_open_failed", raw=getattr(spot, "raw", {}))
+
+                logger.warning(
+                    f"LIVE ORDER SENT | OPEN {plan.coin} SELL ${plan.notional_usd:.2f} reduce_only=False"
+                )
+                perp = self.client.place_perp_order(  # type: ignore[union-attr]
+                    coin=plan.coin,
+                    side="SELL",
+                    notional_usd=plan.notional_usd,
+                    reduce_only=False,
+                )
+                if not getattr(perp, "ok", False) or not getattr(perp, "verified", False):
+                    logger.error("HEDGE_ROLLBACK | perp open failed after spot open, trying spot unwind")
+                    try:
+                        self.client.place_spot_order(  # type: ignore[union-attr]
+                            base_coin=plan.coin,
+                            quote_coin=self.spot_quote,
+                            side="SELL",
+                            notional_usd=plan.notional_usd,
+                            use_available_base_size_for_sell=True,
+                        )
+                    except Exception as rollback_err:
+                        logger.error(f"HEDGE_ROLLBACK_FAIL | spot unwind failed | err={rollback_err!r}")
+                    return perp
+                return perp
+
+            # funding<0 carry (long perp + short spot) needs borrow/margin short, not supported in v1.
+            return SimpleNamespace(
+                ok=False,
+                verified=False,
+                verify_reason="unsupported_long_perp_short_spot_in_v1",
+                raw={},
             )
 
         # CLOSE
-        side = "SELL" if plan.side in ("LONG_PERP", "LONG_PERP_SHORT_SPOT") else "BUY"
+        if plan.side in ("SHORT_PERP", "SHORT_PERP_LONG_SPOT"):
+            logger.warning(
+                f"LIVE ORDER SENT | CLOSE {plan.coin} BUY ${plan.notional_usd:.2f} reduce_only=True"
+            )
+            perp = self.client.place_perp_order(  # type: ignore[union-attr]
+                coin=plan.coin,
+                side="BUY",
+                notional_usd=plan.notional_usd,
+                reduce_only=True,
+            )
+            if not getattr(perp, "ok", False) or not getattr(perp, "verified", False):
+                return perp
+            spot = self.client.place_spot_order(  # type: ignore[union-attr]
+                base_coin=plan.coin,
+                quote_coin=self.spot_quote,
+                side="SELL",
+                notional_usd=plan.notional_usd,
+                use_available_base_size_for_sell=True,
+            )
+            if not getattr(spot, "ok", False):
+                logger.error("HEDGE_CLOSE_WARN | perp closed but spot close failed; manual spot check required")
+                return SimpleNamespace(ok=False, verified=False, verify_reason="spot_close_failed_after_perp_close", raw=getattr(spot, "raw", {}))
+            return perp
+
+        # Legacy long-perp close path: perp-only close.
         logger.warning(
-            f"LIVE ORDER SENT | CLOSE {plan.coin} {side} ${plan.notional_usd:.2f} reduce_only=True"
+            f"LIVE ORDER SENT | CLOSE {plan.coin} SELL ${plan.notional_usd:.2f} reduce_only=True"
         )
         return self.client.place_perp_order(  # type: ignore[union-attr]
             coin=plan.coin,
-            side=side,
+            side="SELL",
             notional_usd=plan.notional_usd,
             reduce_only=True,
         )

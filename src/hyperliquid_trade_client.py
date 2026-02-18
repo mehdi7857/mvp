@@ -43,9 +43,24 @@ class OrderResult:
     cloid: Optional[str]
 
 
+@dataclass(frozen=True)
+class SpotOrderResult:
+    ok: bool
+    raw: Dict[str, Any]
+    pair: str
+    side: str
+    mid_price: float
+    size: float
+    verified: bool
+    verify_reason: str
+    before_base_balance: Optional[float]
+    after_base_balance: Optional[float]
+    cloid: Optional[str]
+
+
 class HyperliquidTradeClient:
     """
-    PERP-ONLY trade client for Hyperliquid.
+    Trade client for Hyperliquid (perp + spot).
 
     Loads wallet private key from process env / .env / .venv.json / env.txt
     via src.hl_keys.get_hl_private_key().
@@ -70,6 +85,11 @@ class HyperliquidTradeClient:
             "HyperliquidTradeClient initialized | "
             f"base_url={base_url} | address={self.address} | pk_source={pk_source}"
         )
+
+    @property
+    def supports_spot(self) -> bool:
+        # SDK exposes both spot and perp symbols via name_to_coin.
+        return hasattr(self.info, "name_to_coin") and isinstance(getattr(self.info, "name_to_coin"), dict)
 
     @staticmethod
     def _normalize_private_key(raw: str) -> str:
@@ -101,6 +121,25 @@ class HyperliquidTradeClient:
             raise RuntimeError(f"Mid price not available for coin={coin}. all_mids keys={list(mids.keys())[:10]}")
         return float(m)
 
+    def _resolve_spot_pair(self, base_coin: str, quote_coin: str = "USDC") -> str:
+        base = str(base_coin).upper().strip()
+        quote = str(quote_coin).upper().strip()
+        candidates = [f"{base}/{quote}", f"{base}:{quote}", f"{quote}/{base}"]
+        for name in candidates:
+            if name in self.info.name_to_coin:
+                return name
+        raise RuntimeError(
+            f"Spot pair not found for {base}/{quote}. "
+            f"name_to_coin sample={list(self.info.name_to_coin.keys())[:12]}"
+        )
+
+    def can_trade_spot_pair(self, base_coin: str, quote_coin: str = "USDC") -> bool:
+        try:
+            _ = self._resolve_spot_pair(base_coin, quote_coin)
+            return True
+        except Exception:
+            return False
+
     def _get_sz_decimals(self, coin: str) -> int:
         try:
             name = self.info.name_to_coin[coin]
@@ -108,6 +147,33 @@ class HyperliquidTradeClient:
             return int(self.info.asset_to_sz_decimals[asset])
         except Exception:
             return 6
+
+    def get_spot_balances(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        try:
+            state = self.info.spot_user_state(self.address)
+        except Exception:
+            return out
+        if not isinstance(state, dict):
+            return out
+        rows = state.get("balances")
+        if not isinstance(rows, list):
+            return out
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("coin") or row.get("token") or row.get("name") or row.get("symbol") or "").upper()
+            if not key:
+                continue
+            val = self._safe_float(row.get("total"))
+            if val is None:
+                val = self._safe_float(row.get("balance"))
+            if val is None:
+                val = self._safe_float(row.get("sz"))
+            if val is None:
+                val = self._safe_float(row.get("amount"))
+            out[key] = float(val or 0.0)
+        return out
 
     def _parse_positions(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
         positions = state.get("assetPositions") or state.get("positions") or []
@@ -349,6 +415,97 @@ class HyperliquidTradeClient:
             before_position=before_pos,
             after_position=after_pos,
             verify_reason=verify_reason,
+            cloid=cloid_txt,
+        )
+
+    def place_spot_order(
+        self,
+        base_coin: str,
+        side: Union[str, bool],
+        notional_usd: float,
+        quote_coin: str = "USDC",
+        slippage: float = 0.01,
+        client_order_id: Optional[str] = None,
+        use_available_base_size_for_sell: bool = False,
+    ) -> SpotOrderResult:
+        """
+        Places a MARKET-like IOC order on spot pair base/quote sized by USD notional.
+        """
+        if isinstance(side, bool):
+            is_buy = side
+            side_txt = "BUY" if is_buy else "SELL"
+        else:
+            side_txt = str(side).upper()
+            if side_txt not in ("BUY", "SELL"):
+                raise ValueError(f"spot side must be BUY or SELL, got {side!r}")
+            is_buy = side_txt == "BUY"
+
+        pair = self._resolve_spot_pair(base_coin, quote_coin)
+        mid = self._get_mid(pair)
+        if mid <= 0:
+            raise RuntimeError(f"Invalid spot mid price for {pair}: {mid}")
+
+        sz = notional_usd / mid
+        sz_decimals = self._get_sz_decimals(pair)
+        scale = 10 ** max(sz_decimals, 0)
+        sz = math.floor(sz * scale) / scale
+        if sz <= 0:
+            raise RuntimeError(f"Spot order size too small after rounding | pair={pair} sz={sz}")
+
+        base = str(base_coin).upper().strip()
+        before_bal = self.get_spot_balances().get(base)
+        if (not is_buy) and use_available_base_size_for_sell and before_bal is not None and before_bal > 0:
+            sz = math.floor(float(before_bal) * scale) / scale
+            if sz <= 0:
+                raise RuntimeError(f"Spot sell size too small after rounding available balance | pair={pair} sz={sz}")
+
+        cloid = self._make_cloid(client_order_id)
+        cloid_txt = str(cloid) if cloid else None
+        logger.warning(
+            f"LIVE SPOT ORDER CALL | {pair} {side_txt} notional=${notional_usd:.2f} "
+            f"sz={sz} cloid={cloid_txt}"
+        )
+
+        resp: Dict[str, Any] = {}
+        if hasattr(self.exchange, "market_open"):
+            resp = self.exchange.market_open(pair, is_buy, sz, slippage=slippage, cloid=cloid)  # type: ignore
+        elif hasattr(self.exchange, "order"):
+            limit_px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+            resp = self.exchange.order(
+                pair,
+                is_buy,
+                sz,
+                limit_px,
+                order_type={"limit": {"tif": "Ioc"}},
+                reduce_only=False,
+                cloid=cloid,
+            )  # type: ignore
+        else:
+            raise RuntimeError("Exchange SDK has no supported method for spot order (market_open/order).")
+
+        logger.info(f"HL_SPOT_RESP | pair={pair} raw={resp}")
+        ok = self._response_ok(resp)
+
+        after_bal = self.get_spot_balances().get(base)
+        if before_bal is not None and after_bal is not None:
+            delta = after_bal - before_bal
+            verified = (delta > 0) if is_buy else (delta < 0)
+            verify_reason = "base_balance_changed" if verified else "base_balance_unchanged"
+        else:
+            verified = ok
+            verify_reason = "balance_snapshot_unavailable"
+
+        return SpotOrderResult(
+            ok=ok and verified,
+            raw=resp if isinstance(resp, dict) else {"resp": resp},
+            pair=pair,
+            side=side_txt,
+            mid_price=mid,
+            size=sz,
+            verified=verified,
+            verify_reason=verify_reason,
+            before_base_balance=before_bal,
+            after_base_balance=after_bal,
             cloid=cloid_txt,
         )
 

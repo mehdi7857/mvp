@@ -19,6 +19,7 @@ from src.models import PositionState
 from src.universe import COINS
 from src.live_executor import LiveExecutor
 from src.config import Config
+from src.hedge_preflight import run_hedge_preflight
 
 
 # --------------------------------------------------
@@ -262,6 +263,21 @@ def main() -> None:
             int(cfg_get("alerts", "MISSED_OPEN_COOLDOWN_SEC", default=180)),
         ),
     )
+    REQUIRE_SPOT_HEDGE_PREFLIGHT = env_bool(
+        "REQUIRE_SPOT_HEDGE_PREFLIGHT",
+        default=bool(cfg_get("runtime", "REQUIRE_SPOT_HEDGE_PREFLIGHT", default=1)),
+    )
+    PREFLIGHT_STRICT_ON_ERROR = env_bool(
+        "PREFLIGHT_STRICT_ON_ERROR",
+        default=bool(cfg_get("runtime", "PREFLIGHT_STRICT_ON_ERROR", default=1)),
+    )
+    PREFLIGHT_SPOT_QUOTE = str(
+        os.getenv("PREFLIGHT_SPOT_QUOTE", str(cfg_get("runtime", "PREFLIGHT_SPOT_QUOTE", default="USDC")))
+    ).strip()
+    PREFLIGHT_TIMEOUT_SECONDS = env_float(
+        "PREFLIGHT_TIMEOUT_SECONDS",
+        float(cfg_get("runtime", "PREFLIGHT_TIMEOUT_SECONDS", default=12.0)),
+    )
 
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
@@ -320,6 +336,10 @@ def main() -> None:
         f"ALERT_EMPTY_CYCLE_COOLDOWN_SEC={ALERT_EMPTY_CYCLE_COOLDOWN_SEC} "
         f"ALERT_MISSED_OPEN_OPP_CYCLES={ALERT_MISSED_OPEN_OPP_CYCLES} "
         f"ALERT_MISSED_OPEN_COOLDOWN_SEC={ALERT_MISSED_OPEN_COOLDOWN_SEC} "
+        f"REQUIRE_SPOT_HEDGE_PREFLIGHT={REQUIRE_SPOT_HEDGE_PREFLIGHT} "
+        f"PREFLIGHT_STRICT_ON_ERROR={PREFLIGHT_STRICT_ON_ERROR} "
+        f"PREFLIGHT_SPOT_QUOTE={PREFLIGHT_SPOT_QUOTE} "
+        f"PREFLIGHT_TIMEOUT_SECONDS={PREFLIGHT_TIMEOUT_SECONDS:.1f} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
@@ -332,7 +352,38 @@ def main() -> None:
     live = LiveExecutor(
         notional_usd=executor.notional_usd,
         safe_mode=not ENABLE_LIVE,
+        spot_quote=PREFLIGHT_SPOT_QUOTE,
     )
+
+    if live_enabled and REQUIRE_SPOT_HEDGE_PREFLIGHT:
+        for coin in COINS:
+            try:
+                preflight = run_hedge_preflight(
+                    coin=coin,
+                    quote=PREFLIGHT_SPOT_QUOTE,
+                    timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                )
+                exec_supports_spot = live.spot_hedge_capability(coin)
+                logger.info(
+                    "HEDGE_PREFLIGHT | "
+                    f"coin={coin} quote={PREFLIGHT_SPOT_QUOTE} "
+                    f"market_hedgeable={preflight.market_hedgeable} "
+                    f"carry_pos={preflight.carry_positive_status} "
+                    f"carry_neg={preflight.carry_negative_status} "
+                    f"spot_candidates={preflight.spot_pair_candidates[:3]} "
+                    f"execution_supports_spot={exec_supports_spot}"
+                )
+                if preflight.market_hedgeable and not exec_supports_spot:
+                    raise RuntimeError(
+                        "HARD_PREFLIGHT_FAIL | market is hedgeable on HL (perp+spot) "
+                        "but executor cannot trade required spot pair for hedge. "
+                        "Check spot symbol mapping / SDK support before live start."
+                    )
+            except Exception as e:
+                if PREFLIGHT_STRICT_ON_ERROR:
+                    logger.error(f"HEDGE_PREFLIGHT_ABORT | coin={coin} err={e!r}")
+                    raise
+                logger.warning(f"HEDGE_PREFLIGHT_WARN_ONLY | coin={coin} err={e!r}")
 
     restored = load_position()
     if restored is not None:
@@ -509,6 +560,14 @@ def main() -> None:
                                     f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | BREAK_EVEN_GATE | "
                                     f"exp_funding=${expected_funding_usd:.6f} fees=${est_fees_usd:.6f} "
                                     f"mult={FUNDING_FEE_MULTIPLE:.2f}"
+                                )
+                                continue
+
+                            if live_enabled and d_open.side == "LONG_PERP":
+                                missed_open_opportunity_cycles[b_snap.coin] = 0
+                                logger.warning(
+                                    f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | "
+                                    "UNSUPPORTED_BRANCH long_perp_short_spot_requires_spot_borrow"
                                 )
                                 continue
 
