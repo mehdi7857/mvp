@@ -301,10 +301,23 @@ def main() -> None:
     funding_edge_default = float(cfg_get("funding_gate", "FUNDING_EDGE_MULTIPLIER", default=2.0))
     if os.getenv("FUNDING_EDGE_MULTIPLIER") is not None:
         FUNDING_FEE_MULTIPLE = env_float("FUNDING_EDGE_MULTIPLIER", funding_edge_default)
-    else:
+        funding_multiplier_source = "env:FUNDING_EDGE_MULTIPLIER"
+    elif os.getenv("FUNDING_FEE_MULTIPLE") is not None:
         # Backward-compat with old env var name used in previous version.
         FUNDING_FEE_MULTIPLE = env_float("FUNDING_FEE_MULTIPLE", funding_edge_default)
+        funding_multiplier_source = "env:FUNDING_FEE_MULTIPLE"
+    else:
+        FUNDING_FEE_MULTIPLE = funding_edge_default
+        funding_multiplier_source = "config:funding_gate.FUNDING_EDGE_MULTIPLIER"
     EST_ROUND_TRIP_FEE_RATE = max(0.0, FEE_RATE_OPEN + FEE_RATE_CLOSE)
+    SLIPPAGE_RATE_EST = env_float(
+        "SLIPPAGE_RATE_EST",
+        float(cfg_get("funding_gate", "SLIPPAGE_RATE_EST", default=0.0)),
+    )
+    BASIS_BUFFER_RATE = env_float(
+        "BASIS_BUFFER_RATE",
+        float(cfg_get("funding_gate", "BASIS_BUFFER_RATE", default=0.0)),
+    )
 
     PREM_ENTRY = env_float("PREM_ENTRY", float(cfg_get("strategy", "PREM_ENTRY", default=0.00030)))
     FUND_ENTRY = env_float("FUND_ENTRY", float(cfg_get("strategy", "FUND_ENTRY", default=0.000006)))
@@ -323,9 +336,10 @@ def main() -> None:
         allow_long_carry=ALLOW_LONG_CARRY,
     )
 
-    base_notional_usd = env_float(
-        "BASE_NOTIONAL_X_USD",
-        float(cfg_get("sizing", "BASE_NOTIONAL_X_USD", default=100.0)),
+    base_notional_default = float(cfg_get("sizing", "BASE_NOTIONAL_X_USD", default=100.0))
+    base_notional_usd = env_float("BASE_NOTIONAL_X_USD", base_notional_default)
+    base_notional_source = (
+        "env:BASE_NOTIONAL_X_USD" if os.getenv("BASE_NOTIONAL_X_USD") is not None else "config:sizing.BASE_NOTIONAL_X_USD"
     )
     executor = DryRunExecutor(notional_usd=base_notional_usd)
 
@@ -352,6 +366,15 @@ def main() -> None:
         f"FUNDING_HORIZON_HOURS={FUNDING_HORIZON_HOURS:.2f} "
         f"FEE_RATE_OPEN={FEE_RATE_OPEN:.6f} FEE_RATE_CLOSE={FEE_RATE_CLOSE:.6f} "
         f"FUNDING_EDGE_MULTIPLIER={FUNDING_FEE_MULTIPLE:.3f}"
+    )
+    logger.info(
+        "EFFECTIVE_CONFIG_DEBUG | "
+        f"funding_multiplier_source={funding_multiplier_source} "
+        f"base_notional_source={base_notional_source} "
+        f"x_usd={executor.notional_usd:.2f} "
+        f"fee_open={FEE_RATE_OPEN:.6f} fee_close={FEE_RATE_CLOSE:.6f} "
+        f"slippage_rate_est={SLIPPAGE_RATE_EST:.6f} basis_buffer_rate={BASIS_BUFFER_RATE:.6f} "
+        f"round_trip_fee_rate_in_gate={EST_ROUND_TRIP_FEE_RATE:.6f}"
     )
 
     # LiveExecutor: safe_mode flips based on ENABLE_LIVE
@@ -559,6 +582,20 @@ def main() -> None:
                             logger.info(
                                 f"[GATE] {b_snap.coin} exp_funding_{FUNDING_HORIZON_HOURS:.0f}h=${expected_funding_usd:.6f} "
                                 f"est_round_trip_fees=${est_fees_usd:.6f} mult={FUNDING_FEE_MULTIPLE:.2f} pass={gate_ok}"
+                            )
+                            ratio = (expected_funding_usd / est_fees_usd) if est_fees_usd > 0 else float("inf")
+                            required_funding = FUNDING_FEE_MULTIPLE * est_fees_usd
+                            logger.info(
+                                f"[GATE_DEBUG] {b_snap.coin} "
+                                f"mult_source={funding_multiplier_source} "
+                                f"x_usd={executor.notional_usd:.2f} "
+                                f"fee_open={FEE_RATE_OPEN:.6f} fee_close={FEE_RATE_CLOSE:.6f} "
+                                f"slippage_rate_est={SLIPPAGE_RATE_EST:.6f} basis_buffer_rate={BASIS_BUFFER_RATE:.6f} "
+                                f"fee_rate_used_in_gate={EST_ROUND_TRIP_FEE_RATE:.6f} "
+                                f"exp_funding_usd={expected_funding_usd:.6f} "
+                                f"fees_usd={est_fees_usd:.6f} "
+                                f"required_funding_usd={required_funding:.6f} "
+                                f"funding_to_fee_ratio={ratio:.6f}"
                             )
                             if not gate_ok:
                                 missed_open_opportunity_cycles[b_snap.coin] = 0
