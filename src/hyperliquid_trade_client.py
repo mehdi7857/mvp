@@ -139,6 +139,13 @@ class HyperliquidTradeClient:
     def _get_mid(self, coin: str) -> float:
         mids = self.info.all_mids()
         m = mids.get(coin)
+        if m is None and hasattr(self.info, "name_to_coin"):
+            try:
+                internal = self.info.name_to_coin.get(coin)
+                if internal is not None:
+                    m = mids.get(str(internal))
+            except Exception:
+                m = None
         if m is None:
             raise RuntimeError(f"Mid price not available for coin={coin}. all_mids keys={list(mids.keys())[:10]}")
         return float(m)
