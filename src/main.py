@@ -310,12 +310,17 @@ def main() -> None:
     FUND_ENTRY = env_float("FUND_ENTRY", float(cfg_get("strategy", "FUND_ENTRY", default=0.000006)))
     PREM_EXIT = env_float("PREM_EXIT", float(cfg_get("strategy", "PREM_EXIT", default=0.00020)))
     FUND_EXIT = env_float("FUND_EXIT", float(cfg_get("strategy", "FUND_EXIT", default=0.000005)))
+    ALLOW_LONG_CARRY = env_bool(
+        "ALLOW_LONG_CARRY",
+        default=bool(cfg_get("strategy", "ALLOW_LONG_CARRY", default=0)),
+    )
 
     strat = FundingPremiumStrategy(
         prem_entry=PREM_ENTRY,
         fund_entry=FUND_ENTRY,
         prem_exit=PREM_EXIT,
         fund_exit=FUND_EXIT,
+        allow_long_carry=ALLOW_LONG_CARRY,
     )
 
     base_notional_usd = env_float(
@@ -342,6 +347,7 @@ def main() -> None:
         f"PREFLIGHT_TIMEOUT_SECONDS={PREFLIGHT_TIMEOUT_SECONDS:.1f} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
+        f"ALLOW_LONG_CARRY={ALLOW_LONG_CARRY} "
         f"BASE_NOTIONAL_X_USD={executor.notional_usd:.2f} "
         f"FUNDING_HORIZON_HOURS={FUNDING_HORIZON_HOURS:.2f} "
         f"FEE_RATE_OPEN={FEE_RATE_OPEN:.6f} FEE_RATE_CLOSE={FEE_RATE_CLOSE:.6f} "

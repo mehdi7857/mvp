@@ -21,11 +21,13 @@ class FundingPremiumStrategy:
         fund_entry: float,
         prem_exit: float,
         fund_exit: float,
+        allow_long_carry: bool = False,
     ) -> None:
         self.prem_entry = prem_entry
         self.fund_entry = fund_entry
         self.prem_exit = prem_exit
         self.fund_exit = fund_exit
+        self.allow_long_carry = allow_long_carry
 
     @staticmethod
     def _abs(x: float) -> float:
@@ -64,6 +66,13 @@ class FundingPremiumStrategy:
             return StrategyDecision("HOLD", None, prem + fund, "short_carry_but_below_entry_thresholds")
 
         if prem < 0 and fund < 0:
+            if not self.allow_long_carry:
+                return StrategyDecision(
+                    "HOLD",
+                    None,
+                    (-prem) + (-fund),
+                    "long_carry_disabled_one_sided_mode",
+                )
             if (-prem) >= self.prem_entry and (-fund) >= self.fund_entry:
                 score = (-prem) + (-fund)
                 return StrategyDecision("OPEN", "LONG_PERP", score, "valid_long_carry_entry")
