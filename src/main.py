@@ -317,6 +317,10 @@ def main() -> None:
         "ENFORCE_POST_FUNDING_VALIDATION",
         default=bool(cfg_get("runtime", "ENFORCE_POST_FUNDING_VALIDATION", default=0)),
     )
+    TEST_FORCE_ENTRY_ONCE = env_bool(
+        "TEST_FORCE_ENTRY_ONCE",
+        default=bool(cfg_get("runtime", "TEST_FORCE_ENTRY_ONCE", default=0)),
+    )
 
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
@@ -401,6 +405,7 @@ def main() -> None:
         f"FUNDING_INTERVAL_SECONDS={FUNDING_INTERVAL_SECONDS} "
         f"POST_FUNDING_VALIDATE_DELAY_SECONDS={POST_FUNDING_VALIDATE_DELAY_SECONDS} "
         f"ENFORCE_POST_FUNDING_VALIDATION={ENFORCE_POST_FUNDING_VALIDATION} "
+        f"TEST_FORCE_ENTRY_ONCE={TEST_FORCE_ENTRY_ONCE} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"ALLOW_LONG_CARRY={ALLOW_LONG_CARRY} "
@@ -544,6 +549,7 @@ def main() -> None:
     missed_open_opportunity_cycles: Dict[str, int] = {c: 0 for c in COINS}
     last_missed_open_alert_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
     pending_funding_validation: Dict[str, Dict[str, Any]] = {}
+    test_force_entry_once_available = TEST_FORCE_ENTRY_ONCE
 
     try:
         while True:
@@ -661,6 +667,27 @@ def main() -> None:
                     # ---------- FLAT ----------
                     if executor.current_side() is None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
+                        if (
+                            test_force_entry_once_available
+                            and d_open.action == "HOLD"
+                            and d_open.reason in (
+                                "short_carry_but_below_entry_thresholds",
+                                "long_carry_but_below_entry_thresholds",
+                            )
+                        ):
+                            forced_side = "SHORT_PERP" if d_open.reason.startswith("short_") else "LONG_PERP"
+                            d_open = StrategyDecision(
+                                action="OPEN",
+                                side=forced_side,
+                                score=d_open.score,
+                                reason=f"{d_open.reason}_test_force_entry_once",
+                            )
+                            test_force_entry_once_available = False
+                            logger.warning(
+                                "[TEST_FORCE_ENTRY] "
+                                f"used=True coin={b_snap.coin} forced_side={forced_side} "
+                                "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY]"
+                            )
 
                         if d_open.action == "OPEN":
                             precheck_pass = side_expected_receive(d_open.side, b_snap.fundingRate)
