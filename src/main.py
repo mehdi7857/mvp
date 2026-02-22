@@ -60,6 +60,27 @@ def calc_expected_funding_and_fees(
     return expected_funding_usd, est_fees_usd
 
 
+def compute_next_funding_ms(snapshot_ms: int, interval_sec: int) -> int:
+    interval_ms = max(1, interval_sec) * 1000
+    return ((int(snapshot_ms) // interval_ms) + 1) * interval_ms
+
+
+def funding_interpretation(rate: float) -> str:
+    if rate > 0:
+        return "long_pays_short_receives"
+    if rate < 0:
+        return "long_receives_short_pays"
+    return "flat_or_zero"
+
+
+def side_expected_receive(side: str, rate: float) -> bool:
+    if side == "SHORT_PERP":
+        return rate > 0
+    if side == "LONG_PERP":
+        return rate < 0
+    return False
+
+
 # --------------------------------------------------
 # FUNDING SIGN LOGIC (FIXED)
 # --------------------------------------------------
@@ -278,6 +299,24 @@ def main() -> None:
         "PREFLIGHT_TIMEOUT_SECONDS",
         float(cfg_get("runtime", "PREFLIGHT_TIMEOUT_SECONDS", default=12.0)),
     )
+    FUNDING_INTERVAL_SECONDS = max(
+        60,
+        env_int(
+            "FUNDING_INTERVAL_SECONDS",
+            int(cfg_get("runtime", "FUNDING_INTERVAL_SECONDS", default=3600)),
+        ),
+    )
+    POST_FUNDING_VALIDATE_DELAY_SECONDS = max(
+        0,
+        env_int(
+            "POST_FUNDING_VALIDATE_DELAY_SECONDS",
+            int(cfg_get("runtime", "POST_FUNDING_VALIDATE_DELAY_SECONDS", default=60)),
+        ),
+    )
+    ENFORCE_POST_FUNDING_VALIDATION = env_bool(
+        "ENFORCE_POST_FUNDING_VALIDATION",
+        default=bool(cfg_get("runtime", "ENFORCE_POST_FUNDING_VALIDATION", default=0)),
+    )
 
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
@@ -359,6 +398,9 @@ def main() -> None:
         f"PREFLIGHT_STRICT_ON_ERROR={PREFLIGHT_STRICT_ON_ERROR} "
         f"PREFLIGHT_SPOT_QUOTE={PREFLIGHT_SPOT_QUOTE} "
         f"PREFLIGHT_TIMEOUT_SECONDS={PREFLIGHT_TIMEOUT_SECONDS:.1f} "
+        f"FUNDING_INTERVAL_SECONDS={FUNDING_INTERVAL_SECONDS} "
+        f"POST_FUNDING_VALIDATE_DELAY_SECONDS={POST_FUNDING_VALIDATE_DELAY_SECONDS} "
+        f"ENFORCE_POST_FUNDING_VALIDATION={ENFORCE_POST_FUNDING_VALIDATION} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"ALLOW_LONG_CARRY={ALLOW_LONG_CARRY} "
@@ -501,6 +543,7 @@ def main() -> None:
     last_empty_alert_ms: Optional[int] = None
     missed_open_opportunity_cycles: Dict[str, int] = {c: 0 for c in COINS}
     last_missed_open_alert_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
+    pending_funding_validation: Dict[str, Dict[str, Any]] = {}
 
     try:
         while True:
@@ -565,12 +608,80 @@ def main() -> None:
                         f"'fundingRate': {raw.get('fundingRate')}, "
                         f"'premium': {raw.get('premium')}}}"
                     )
+                    next_funding_ms = compute_next_funding_ms(b_snap.time, FUNDING_INTERVAL_SECONDS)
+                    logger.info(
+                        "[FUNDING_SRC] "
+                        f"coin={b_snap.coin} rate={b_snap.fundingRate:+.6f} premium={b_snap.premium:+.6f} "
+                        f"snapshot_time={now_iso(b_snap.time)} next_funding_time={now_iso(next_funding_ms)} "
+                        f"funding_interval_sec={FUNDING_INTERVAL_SECONDS} "
+                        f"interpretation={funding_interpretation(b_snap.fundingRate)}"
+                    )
+
+                    # Post-funding validation checks whether side is still aligned with funding direction.
+                    pending = pending_funding_validation.get(b_snap.coin)
+                    if pending is not None and b_snap.time >= int(pending["next_funding_ms"]) + (POST_FUNDING_VALIDATE_DELAY_SECONDS * 1000):
+                        curr_side = str(pending.get("side", ""))
+                        validation_pass = side_expected_receive(curr_side, b_snap.fundingRate)
+                        if validation_pass:
+                            logger.info(
+                                "[POST_FUNDING_VALIDATION] "
+                                f"coin={b_snap.coin} side={curr_side} expected_next_funding={now_iso(int(pending['next_funding_ms']))} "
+                                f"check_time={now_iso(b_snap.time)} funding_rate={b_snap.fundingRate:+.6f} "
+                                "action=VALIDATED_OK"
+                            )
+                            pending_funding_validation.pop(b_snap.coin, None)
+                        else:
+                            action_txt = "WARN_ONLY"
+                            logger.error(
+                                "[POST_FUNDING_VALIDATION] "
+                                f"coin={b_snap.coin} side={curr_side} expected_next_funding={now_iso(int(pending['next_funding_ms']))} "
+                                f"check_time={now_iso(b_snap.time)} funding_rate={b_snap.fundingRate:+.6f} "
+                                "action=CLOSE_ALL+DISABLE_LIVE reason=unexpected_funding_direction"
+                            )
+                            if ENFORCE_POST_FUNDING_VALIDATION:
+                                action_txt = "ENFORCED_CLOSE_ALL+DISABLE_LIVE"
+                                if executor.current_side() is not None:
+                                    forced = StrategyDecision(
+                                        action="CLOSE",
+                                        side=executor.current_side(),
+                                        reason="post_funding_validation_failed",
+                                    )
+                                    plan = live.preview(b_snap, "CLOSE", forced.side, forced.reason)
+                                    if live_enabled:
+                                        _ = live.execute(plan)
+                                    _ = executor.on_decision(b_snap, forced)
+                                live_enabled = False
+                                logger.error("EXECUTION_DESYNC_ABORT | live trading disabled until restart")
+                            logger.warning(
+                                "[POST_FUNDING_VALIDATION] "
+                                f"coin={b_snap.coin} enforcement={ENFORCE_POST_FUNDING_VALIDATION} result={action_txt}"
+                            )
+                            pending_funding_validation.pop(b_snap.coin, None)
 
                     # ---------- FLAT ----------
                     if executor.current_side() is None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
 
                         if d_open.action == "OPEN":
+                            precheck_pass = side_expected_receive(d_open.side, b_snap.fundingRate)
+                            precheck_reason = (
+                                "aligned_with_funding_direction"
+                                if precheck_pass
+                                else "side_not_receiver_under_current_funding_sign"
+                            )
+                            logger.info(
+                                "[PRECHECK_FUNDING_DIRECTION] "
+                                f"coin={b_snap.coin} side={d_open.side} funding_rate={b_snap.fundingRate:+.6f} "
+                                f"pass={precheck_pass} reason={precheck_reason}"
+                            )
+                            if not precheck_pass:
+                                missed_open_opportunity_cycles[b_snap.coin] = 0
+                                logger.warning(
+                                    f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | PRECHECK_FUNDING_DIRECTION | "
+                                    f"reason={precheck_reason}"
+                                )
+                                continue
+
                             # Break-even gate: funding must cover estimated fees.
                             expected_funding_usd, est_fees_usd = calc_expected_funding_and_fees(
                                 b_snap.fundingRate,
@@ -660,6 +771,17 @@ def main() -> None:
                             status = executor.on_decision(b_snap, d_open)
                             if status.startswith("OPENED"):
                                 missed_open_opportunity_cycles[b_snap.coin] = 0
+                                pending_funding_validation[b_snap.coin] = {
+                                    "side": d_open.side,
+                                    "opened_at_ms": b_snap.time,
+                                    "next_funding_ms": compute_next_funding_ms(b_snap.time, FUNDING_INTERVAL_SECONDS),
+                                }
+                                logger.info(
+                                    "[POST_FUNDING_VALIDATION_ARMED] "
+                                    f"coin={b_snap.coin} side={d_open.side} "
+                                    f"opened_at={now_iso(b_snap.time)} "
+                                    f"next_funding_time={now_iso(int(pending_funding_validation[b_snap.coin]['next_funding_ms']))}"
+                                )
                             logger.info(f"[{now_iso(b_snap.time)}] [{b_snap.coin}] OPEN | {status}")
 
                         else:
@@ -724,6 +846,14 @@ def main() -> None:
                                 last_trade_ms[b_snap.coin] = b_snap.time
 
                             status = executor.on_decision(b_snap, d_close)
+                            if status.startswith("CLOSED"):
+                                pending_funding_validation.pop(b_snap.coin, None)
+                                logger.info(
+                                    "[ACCOUNTING_SPLIT] "
+                                    f"coin={b_snap.coin} side={d_close.side} "
+                                    "funding_pnl=NA overlay_pnl=NA basis_pnl=NA fees=NA net=NA "
+                                    "note=v1_placeholder_no_ledger_attribution"
+                                )
                             logger.info(f"[{now_iso(b_snap.time)}] [{b_snap.coin}] CLOSE | {status}")
 
                         else:
