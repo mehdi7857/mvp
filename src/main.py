@@ -551,6 +551,7 @@ def main() -> None:
     pending_funding_validation: Dict[str, Dict[str, Any]] = {}
     test_force_entry_once_available = TEST_FORCE_ENTRY_ONCE
     test_force_gate_once_available = TEST_FORCE_ENTRY_ONCE
+    branch_guard_logged: Dict[str, bool] = {c: False for c in COINS}
 
     try:
         while True:
@@ -676,19 +677,34 @@ def main() -> None:
                                 "long_carry_but_below_entry_thresholds",
                             )
                         ):
-                            forced_side = "SHORT_PERP" if d_open.reason.startswith("short_") else "LONG_PERP"
-                            d_open = StrategyDecision(
-                                action="OPEN",
-                                side=forced_side,
-                                score=d_open.score,
-                                reason=f"{d_open.reason}_test_force_entry_once",
-                            )
-                            test_force_entry_once_available = False
-                            logger.warning(
-                                "[TEST_FORCE_ENTRY] "
-                                f"used=True coin={b_snap.coin} forced_side={forced_side} "
-                                "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY]"
-                            )
+                            if d_open.reason.startswith("long_"):
+                                if not branch_guard_logged.get(b_snap.coin, False):
+                                    logger.warning(
+                                        "[BRANCH_GUARD] "
+                                        f"coin={b_snap.coin} unsupported_branch_requires_spot_borrow "
+                                        "force_entry_skipped=True"
+                                    )
+                                    branch_guard_logged[b_snap.coin] = True
+                                d_open = StrategyDecision(
+                                    action="HOLD",
+                                    side=None,
+                                    score=d_open.score,
+                                    reason="long_carry_disabled_one_sided_mode",
+                                )
+                            else:
+                                forced_side = "SHORT_PERP"
+                                d_open = StrategyDecision(
+                                    action="OPEN",
+                                    side=forced_side,
+                                    score=d_open.score,
+                                    reason=f"{d_open.reason}_test_force_entry_once",
+                                )
+                                test_force_entry_once_available = False
+                                logger.warning(
+                                    "[TEST_FORCE_ENTRY] "
+                                    f"used=True coin={b_snap.coin} forced_side={forced_side} "
+                                    "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY]"
+                                )
 
                         if d_open.action == "OPEN":
                             precheck_pass = side_expected_receive(d_open.side, b_snap.fundingRate)
@@ -736,7 +752,7 @@ def main() -> None:
                                 f"required_funding_usd={required_funding:.6f} "
                                 f"funding_to_fee_ratio={ratio:.6f}"
                             )
-                            if not gate_ok and test_force_gate_once_available:
+                            if not gate_ok and test_force_gate_once_available and d_open.side == "SHORT_PERP":
                                 logger.warning(
                                     "[TEST_FORCE_ENTRY] "
                                     f"used=True coin={b_snap.coin} side={d_open.side} "
