@@ -552,6 +552,7 @@ def main() -> None:
     test_force_entry_once_available = TEST_FORCE_ENTRY_ONCE
     test_force_gate_once_available = TEST_FORCE_ENTRY_ONCE
     branch_guard_logged: Dict[str, bool] = {c: False for c in COINS}
+    last_funding_sign: Dict[str, int] = {c: 0 for c in COINS}
 
     try:
         while True:
@@ -624,6 +625,15 @@ def main() -> None:
                         f"funding_interval_sec={FUNDING_INTERVAL_SECONDS} "
                         f"interpretation={funding_interpretation(b_snap.fundingRate)}"
                     )
+                    sign_now = 1 if b_snap.fundingRate > 0 else (-1 if b_snap.fundingRate < 0 else 0)
+                    sign_prev = last_funding_sign.get(b_snap.coin, 0)
+                    if sign_now != sign_prev and sign_prev != 0:
+                        logger.info(
+                            "[FUNDING_SIGN_FLIP] "
+                            f"coin={b_snap.coin} prev={sign_prev:+d} now={sign_now:+d} "
+                            f"rate={b_snap.fundingRate:+.6f} next_funding_time={now_iso(next_funding_ms)}"
+                        )
+                    last_funding_sign[b_snap.coin] = sign_now
 
                     # Post-funding validation checks whether side is still aligned with funding direction.
                     pending = pending_funding_validation.get(b_snap.coin)
@@ -669,6 +679,20 @@ def main() -> None:
                     # ---------- FLAT ----------
                     if executor.current_side() is None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
+                        if test_force_entry_once_available and b_snap.fundingRate > 0:
+                            d_open = StrategyDecision(
+                                action="OPEN",
+                                side="SHORT_PERP",
+                                score=d_open.score,
+                                reason=f"{d_open.reason}_test_force_entry_once_short_only",
+                            )
+                            test_force_entry_once_available = False
+                            logger.warning(
+                                "[TEST_FORCE_ENTRY] "
+                                f"used=True coin={b_snap.coin} forced_side=SHORT_PERP "
+                                "trigger=funding_rate_positive "
+                                "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY,PREMIUM_SIGN]"
+                            )
                         if (
                             test_force_entry_once_available
                             and d_open.action == "HOLD"
