@@ -550,6 +550,7 @@ def main() -> None:
     last_missed_open_alert_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
     pending_funding_validation: Dict[str, Dict[str, Any]] = {}
     test_force_entry_once_available = TEST_FORCE_ENTRY_ONCE
+    test_force_gate_once_available = TEST_FORCE_ENTRY_ONCE
 
     try:
         while True:
@@ -735,6 +736,16 @@ def main() -> None:
                                 f"required_funding_usd={required_funding:.6f} "
                                 f"funding_to_fee_ratio={ratio:.6f}"
                             )
+                            if not gate_ok and test_force_gate_once_available:
+                                logger.warning(
+                                    "[TEST_FORCE_ENTRY] "
+                                    f"used=True coin={b_snap.coin} side={d_open.side} "
+                                    "bypassed_gate=True reason=integration_test_only"
+                                )
+                                gate_ok = True
+                                test_force_gate_once_available = False
+                                test_force_entry_once_available = False
+
                             if not gate_ok:
                                 missed_open_opportunity_cycles[b_snap.coin] = 0
                                 logger.warning(
