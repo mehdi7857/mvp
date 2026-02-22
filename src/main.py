@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -79,6 +80,28 @@ def side_expected_receive(side: str, rate: float) -> bool:
     if side == "LONG_PERP":
         return rate < 0
     return False
+
+
+DEFAULT_TEST_STATE_PATH = "configs/test_harness_state.json"
+
+
+def load_test_state(path: str = DEFAULT_TEST_STATE_PATH) -> Dict[str, Any]:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_test_state(state: Dict[str, Any], path: str = DEFAULT_TEST_STATE_PATH) -> None:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"TEST_STATE_SAVE_FAILED | path={path} err={e!r}")
 
 
 # --------------------------------------------------
@@ -321,6 +344,24 @@ def main() -> None:
         "TEST_FORCE_ENTRY_ONCE",
         default=bool(cfg_get("runtime", "TEST_FORCE_ENTRY_ONCE", default=0)),
     )
+    TEST_FORCE_FUNDING_POS_EPS = max(
+        0.0,
+        env_float(
+            "TEST_FORCE_FUNDING_POS_EPS",
+            float(cfg_get("runtime", "TEST_FORCE_FUNDING_POS_EPS", default=1e-8)),
+        ),
+    )
+    TEST_MAX_WAIT_INTERVALS = max(
+        0,
+        env_int(
+            "TEST_MAX_WAIT_INTERVALS",
+            int(cfg_get("runtime", "TEST_MAX_WAIT_INTERVALS", default=24)),
+        ),
+    )
+    TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION = env_bool(
+        "TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION",
+        default=bool(cfg_get("runtime", "TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION", default=1)),
+    )
 
     # Single gate switch
     # Safe-by-default: requires explicit ENABLE_LIVE=1 to place real orders.
@@ -406,6 +447,9 @@ def main() -> None:
         f"POST_FUNDING_VALIDATE_DELAY_SECONDS={POST_FUNDING_VALIDATE_DELAY_SECONDS} "
         f"ENFORCE_POST_FUNDING_VALIDATION={ENFORCE_POST_FUNDING_VALIDATION} "
         f"TEST_FORCE_ENTRY_ONCE={TEST_FORCE_ENTRY_ONCE} "
+        f"TEST_FORCE_FUNDING_POS_EPS={TEST_FORCE_FUNDING_POS_EPS:.10f} "
+        f"TEST_MAX_WAIT_INTERVALS={TEST_MAX_WAIT_INTERVALS} "
+        f"TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION={TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION} "
         f"PREM_ENTRY={PREM_ENTRY:.6f} FUND_ENTRY={FUND_ENTRY:.6f} "
         f"PREM_EXIT={PREM_EXIT:.6f} FUND_EXIT={FUND_EXIT:.6f} "
         f"ALLOW_LONG_CARRY={ALLOW_LONG_CARRY} "
@@ -549,10 +593,27 @@ def main() -> None:
     missed_open_opportunity_cycles: Dict[str, int] = {c: 0 for c in COINS}
     last_missed_open_alert_ms: Dict[str, Optional[int]] = {c: None for c in COINS}
     pending_funding_validation: Dict[str, Dict[str, Any]] = {}
-    test_force_entry_once_available = TEST_FORCE_ENTRY_ONCE
-    test_force_gate_once_available = TEST_FORCE_ENTRY_ONCE
+    loaded_test_state = load_test_state()
+    if TEST_FORCE_ENTRY_ONCE:
+        test_force_entry_once_available = bool(loaded_test_state.get("force_entry_once_available", True))
+        test_force_gate_once_available = bool(loaded_test_state.get("force_gate_once_available", True))
+    else:
+        test_force_entry_once_available = False
+        test_force_gate_once_available = False
+    test_wait_intervals: Dict[str, int] = {c: int((loaded_test_state.get("wait_intervals", {}) or {}).get(c, 0)) for c in COINS}
     branch_guard_logged: Dict[str, bool] = {c: False for c in COINS}
     last_funding_sign: Dict[str, int] = {c: 0 for c in COINS}
+
+    def persist_test_harness_state() -> None:
+        save_test_state(
+            {
+                "force_entry_once_available": test_force_entry_once_available,
+                "force_gate_once_available": test_force_gate_once_available,
+                "wait_intervals": test_wait_intervals,
+            }
+        )
+
+    persist_test_harness_state()
 
     try:
         while True:
@@ -634,6 +695,23 @@ def main() -> None:
                             f"rate={b_snap.fundingRate:+.6f} next_funding_time={now_iso(next_funding_ms)}"
                         )
                     last_funding_sign[b_snap.coin] = sign_now
+                    if test_force_entry_once_available:
+                        if b_snap.fundingRate >= TEST_FORCE_FUNDING_POS_EPS:
+                            test_wait_intervals[b_snap.coin] = 0
+                        else:
+                            test_wait_intervals[b_snap.coin] = int(test_wait_intervals.get(b_snap.coin, 0)) + 1
+                            if TEST_MAX_WAIT_INTERVALS > 0 and test_wait_intervals[b_snap.coin] >= TEST_MAX_WAIT_INTERVALS:
+                                test_force_entry_once_available = False
+                                test_force_gate_once_available = False
+                                live_enabled = False
+                                persist_test_harness_state()
+                                logger.error(
+                                    "[TEST_TIMEOUT] "
+                                    f"coin={b_snap.coin} waited_intervals={test_wait_intervals[b_snap.coin]} "
+                                    f"limit={TEST_MAX_WAIT_INTERVALS} action=DISABLE_LIVE_AND_DISARM"
+                                )
+                                continue
+                        persist_test_harness_state()
 
                     # Post-funding validation checks whether side is still aligned with funding direction.
                     pending = pending_funding_validation.get(b_snap.coin)
@@ -648,6 +726,14 @@ def main() -> None:
                                 "action=VALIDATED_OK"
                             )
                             pending_funding_validation.pop(b_snap.coin, None)
+                            if TEST_AUTO_DISABLE_LIVE_AFTER_VALIDATION:
+                                live_enabled = False
+                                test_force_entry_once_available = False
+                                test_force_gate_once_available = False
+                                persist_test_harness_state()
+                                logger.warning(
+                                    "TEST_AUTO_DISABLE | reason=post_funding_validated_ok action=LIVE_DISABLED_AND_DISARMED"
+                                )
                         else:
                             action_txt = "WARN_ONLY"
                             logger.error(
@@ -669,6 +755,9 @@ def main() -> None:
                                         _ = live.execute(plan)
                                     _ = executor.on_decision(b_snap, forced)
                                 live_enabled = False
+                                test_force_entry_once_available = False
+                                test_force_gate_once_available = False
+                                persist_test_harness_state()
                                 logger.error("EXECUTION_DESYNC_ABORT | live trading disabled until restart")
                             logger.warning(
                                 "[POST_FUNDING_VALIDATION] "
@@ -679,7 +768,7 @@ def main() -> None:
                     # ---------- FLAT ----------
                     if executor.current_side() is None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
-                        if test_force_entry_once_available and b_snap.fundingRate > 0:
+                        if test_force_entry_once_available and b_snap.fundingRate >= TEST_FORCE_FUNDING_POS_EPS:
                             d_open = StrategyDecision(
                                 action="OPEN",
                                 side="SHORT_PERP",
@@ -687,10 +776,12 @@ def main() -> None:
                                 reason=f"{d_open.reason}_test_force_entry_once_short_only",
                             )
                             test_force_entry_once_available = False
+                            persist_test_harness_state()
                             logger.warning(
                                 "[TEST_FORCE_ENTRY] "
                                 f"used=True coin={b_snap.coin} forced_side=SHORT_PERP "
-                                "trigger=funding_rate_positive "
+                                f"trigger=funding_rate_positive_eps raw_funding={b_snap.fundingRate:+.10f} "
+                                f"eps={TEST_FORCE_FUNDING_POS_EPS:.10f} "
                                 "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY,PREMIUM_SIGN]"
                             )
                         if (
@@ -724,6 +815,7 @@ def main() -> None:
                                     reason=f"{d_open.reason}_test_force_entry_once",
                                 )
                                 test_force_entry_once_available = False
+                                persist_test_harness_state()
                                 logger.warning(
                                     "[TEST_FORCE_ENTRY] "
                                     f"used=True coin={b_snap.coin} forced_side={forced_side} "
@@ -785,6 +877,7 @@ def main() -> None:
                                 gate_ok = True
                                 test_force_gate_once_available = False
                                 test_force_entry_once_available = False
+                                persist_test_harness_state()
 
                             if not gate_ok:
                                 missed_open_opportunity_cycles[b_snap.coin] = 0
