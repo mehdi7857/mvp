@@ -104,6 +104,36 @@ def save_test_state(state: Dict[str, Any], path: str = DEFAULT_TEST_STATE_PATH) 
         logger.warning(f"TEST_STATE_SAVE_FAILED | path={path} err={e!r}")
 
 
+def send_notification(webhook_url: str, telegram_token: str, telegram_chat_id: str, text: str) -> None:
+    """
+    Best-effort notifier. Never raises into trading loop.
+    Supports:
+      - generic webhook (POST JSON {"text": ...})
+      - Telegram bot API
+    """
+    try:
+        if webhook_url:
+            with httpx.Client(timeout=5.0) as c:
+                c.post(webhook_url, json={"text": text})
+    except Exception as e:
+        logger.warning(f"NOTIFY_WEBHOOK_FAILED | err={e!r}")
+
+    try:
+        if telegram_token and telegram_chat_id:
+            tg_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+            with httpx.Client(timeout=5.0) as c:
+                c.post(
+                    tg_url,
+                    json={
+                        "chat_id": telegram_chat_id,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    },
+                )
+    except Exception as e:
+        logger.warning(f"NOTIFY_TELEGRAM_FAILED | err={e!r}")
+
+
 def flatten_exchange_exposure_fail_closed(
     live: LiveExecutor,
     coin: str,
@@ -367,6 +397,24 @@ def main() -> None:
             int(cfg_get("alerts", "MISSED_OPEN_COOLDOWN_SEC", default=180)),
         ),
     )
+    NOTIFY_WEBHOOK_URL = str(
+        os.getenv(
+            "NOTIFY_WEBHOOK_URL",
+            str(cfg_get("alerts", "NOTIFY_WEBHOOK_URL", default="")),
+        )
+    ).strip()
+    TELEGRAM_BOT_TOKEN = str(
+        os.getenv(
+            "TELEGRAM_BOT_TOKEN",
+            str(cfg_get("alerts", "TELEGRAM_BOT_TOKEN", default="")),
+        )
+    ).strip()
+    TELEGRAM_CHAT_ID = str(
+        os.getenv(
+            "TELEGRAM_CHAT_ID",
+            str(cfg_get("alerts", "TELEGRAM_CHAT_ID", default="")),
+        )
+    ).strip()
     REQUIRE_SPOT_HEDGE_PREFLIGHT = env_bool(
         "REQUIRE_SPOT_HEDGE_PREFLIGHT",
         default=bool(cfg_get("runtime", "REQUIRE_SPOT_HEDGE_PREFLIGHT", default=1)),
@@ -499,6 +547,8 @@ def main() -> None:
         f"ALERT_EMPTY_CYCLE_COOLDOWN_SEC={ALERT_EMPTY_CYCLE_COOLDOWN_SEC} "
         f"ALERT_MISSED_OPEN_OPP_CYCLES={ALERT_MISSED_OPEN_OPP_CYCLES} "
         f"ALERT_MISSED_OPEN_COOLDOWN_SEC={ALERT_MISSED_OPEN_COOLDOWN_SEC} "
+        f"NOTIFY_WEBHOOK_ENABLED={bool(NOTIFY_WEBHOOK_URL)} "
+        f"NOTIFY_TELEGRAM_ENABLED={bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)} "
         f"REQUIRE_SPOT_HEDGE_PREFLIGHT={REQUIRE_SPOT_HEDGE_PREFLIGHT} "
         f"PREFLIGHT_STRICT_ON_ERROR={PREFLIGHT_STRICT_ON_ERROR} "
         f"PREFLIGHT_SPOT_QUOTE={PREFLIGHT_SPOT_QUOTE} "
@@ -785,17 +835,36 @@ def main() -> None:
                     )
                     sign_now = 1 if b_snap.fundingRate > 0 else (-1 if b_snap.fundingRate < 0 else 0)
                     sign_prev = last_funding_sign.get(b_snap.coin, 0)
+                    logger.info(
+                        "[FUNDING_SIGN_STATE] "
+                        f"coin={b_snap.coin} sign={sign_now:+d} rate={b_snap.fundingRate:+.6f} "
+                        f"next_funding_time={now_iso(next_funding_ms)}"
+                    )
                     if sign_now != sign_prev and sign_prev != 0:
-                        logger.info(
+                        flip_msg = (
                             "[FUNDING_SIGN_FLIP] "
                             f"coin={b_snap.coin} prev={sign_prev:+d} now={sign_now:+d} "
                             f"rate={b_snap.fundingRate:+.6f} next_funding_time={now_iso(next_funding_ms)}"
                         )
+                        logger.info(flip_msg)
+                        send_notification(
+                            NOTIFY_WEBHOOK_URL,
+                            TELEGRAM_BOT_TOKEN,
+                            TELEGRAM_CHAT_ID,
+                            flip_msg,
+                        )
                         if sign_now > 0:
-                            logger.warning(
+                            pos_msg = (
                                 "[ALERT] funding_positive_regime_detected "
                                 f"coin={b_snap.coin} rate={b_snap.fundingRate:+.6f} "
                                 f"next_funding_time={now_iso(next_funding_ms)}"
+                            )
+                            logger.warning(pos_msg)
+                            send_notification(
+                                NOTIFY_WEBHOOK_URL,
+                                TELEGRAM_BOT_TOKEN,
+                                TELEGRAM_CHAT_ID,
+                                pos_msg,
                             )
                     last_funding_sign[b_snap.coin] = sign_now
                     if test_force_entry_once_available:
