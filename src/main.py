@@ -15,7 +15,7 @@ from src.logger import setup_logger
 from src.models import Snapshot
 from src.strategy import FundingPremiumStrategy, StrategyDecision
 from src.executor import DryRunExecutor
-from src.state import load_position, save_position
+from src.state import load_position, save_position, save_position_or_raise
 from src.models import PositionState
 from src.universe import COINS
 from src.live_executor import LiveExecutor
@@ -102,6 +102,66 @@ def save_test_state(state: Dict[str, Any], path: str = DEFAULT_TEST_STATE_PATH) 
         p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning(f"TEST_STATE_SAVE_FAILED | path={path} err={e!r}")
+
+
+def flatten_exchange_exposure_fail_closed(
+    live: LiveExecutor,
+    coin: str,
+    notional_usd: float,
+    spot_quote: str,
+) -> bool:
+    """
+    Best-effort fail-closed flatten for ghost exposure:
+    1) close perp reduce-only
+    2) sell spot base inventory
+    """
+    try:
+        live.ensure_client()
+        client = live.client  # type: ignore[assignment]
+        positions = client.get_positions(coin=coin)
+        if positions:
+            szi = float(positions[0].get("szi") or 0.0)
+            if szi != 0.0:
+                side = "BUY" if szi < 0 else "SELL"
+                perp = client.place_perp_order(
+                    coin=coin,
+                    side=side,
+                    notional_usd=notional_usd,
+                    reduce_only=True,
+                )
+                if not getattr(perp, "ok", False) or not getattr(perp, "verified", False):
+                    logger.error(
+                        "[GHOST_POSITION_DETECTED] "
+                        f"coin={coin} stage=close_perp_failed reason={getattr(perp, 'verify_reason', None)}"
+                    )
+                    return False
+
+        balances = client.get_spot_balances() or {}
+        base_total = 0.0
+        for k in (coin, f"U{coin}", f"W{coin}"):
+            try:
+                base_total += float(balances.get(k, 0.0) or 0.0)
+            except Exception:
+                pass
+        if base_total > 0:
+            spot = client.place_spot_order(
+                base_coin=coin,
+                quote_coin=spot_quote,
+                side="SELL",
+                notional_usd=notional_usd,
+                use_available_base_size_for_sell=True,
+            )
+            # Spot close can legitimately return non-verified with tiny dust; keep only hard failures.
+            if not getattr(spot, "ok", False):
+                logger.error(
+                    "[GHOST_POSITION_DETECTED] "
+                    f"coin={coin} stage=close_spot_failed reason={getattr(spot, 'verify_reason', None)}"
+                )
+                return False
+        return True
+    except Exception as e:
+        logger.error(f"[GHOST_POSITION_DETECTED] coin={coin} stage=exception err={e!r}")
+        return False
 
 
 # --------------------------------------------------
@@ -516,6 +576,36 @@ def main() -> None:
         try:
             live.ensure_client()
             live_positions = live.client.get_positions()  # type: ignore[union-attr]
+            if live_positions and restored is None:
+                logger.error(
+                    "[GHOST_POSITION_DETECTED] "
+                    f"positions_len={len(live_positions)} state_position=null action=CLOSE_ALL+DISABLE_LIVE"
+                )
+                ghost_close_ok = True
+                for p in live_positions:
+                    gcoin = str(p.get("coin") or "")
+                    if not gcoin:
+                        continue
+                    if not flatten_exchange_exposure_fail_closed(
+                        live=live,
+                        coin=gcoin,
+                        notional_usd=executor.notional_usd,
+                        spot_quote=PREFLIGHT_SPOT_QUOTE,
+                    ):
+                        ghost_close_ok = False
+                executor.position = None
+                try:
+                    save_position_or_raise(None)
+                except Exception as e:
+                    logger.error(f"[STATE_ARM] fail action=flat_reset_after_ghost err={e!r}")
+                live_enabled = False
+                if ghost_close_ok:
+                    logger.error("GHOST_FAIL_CLOSED_OK | action=LIVE_DISABLED")
+                else:
+                    logger.error("GHOST_FAIL_CLOSED_FAILED | manual_intervention_required action=LIVE_DISABLED")
+                # Do not continue startup state sync after fail-closed branch.
+                live_positions = []
+
             if not live_positions:
                 if restored is not None:
                     logger.warning("STATE_SYNC_FLAT | exchange has no positions -> resetting state to FLAT")
@@ -565,6 +655,13 @@ def main() -> None:
             logger.warning(f"PRESTART_MARKET_CHECK | coin={coin} status=no_data")
             continue
         pre_decision = strat.decide_open(pre_snap)
+        if pre_decision.action == "OPEN" and pre_decision.side == "LONG_PERP":
+            pre_decision = StrategyDecision(
+                action="HOLD",
+                side=None,
+                score=pre_decision.score,
+                reason="long_carry_disabled_one_sided_mode",
+            )
         pre_expected_funding_usd, pre_est_fees_usd = calc_expected_funding_and_fees(
             pre_snap.fundingRate,
             executor.notional_usd,
@@ -694,6 +791,12 @@ def main() -> None:
                             f"coin={b_snap.coin} prev={sign_prev:+d} now={sign_now:+d} "
                             f"rate={b_snap.fundingRate:+.6f} next_funding_time={now_iso(next_funding_ms)}"
                         )
+                        if sign_now > 0:
+                            logger.warning(
+                                "[ALERT] funding_positive_regime_detected "
+                                f"coin={b_snap.coin} rate={b_snap.fundingRate:+.6f} "
+                                f"next_funding_time={now_iso(next_funding_ms)}"
+                            )
                     last_funding_sign[b_snap.coin] = sign_now
                     if test_force_entry_once_available:
                         if b_snap.fundingRate >= TEST_FORCE_FUNDING_POS_EPS:
@@ -768,22 +871,6 @@ def main() -> None:
                     # ---------- FLAT ----------
                     if executor.current_side() is None:
                         d_open: StrategyDecision = strat.decide_open(b_snap)
-                        if test_force_entry_once_available and b_snap.fundingRate >= TEST_FORCE_FUNDING_POS_EPS:
-                            d_open = StrategyDecision(
-                                action="OPEN",
-                                side="SHORT_PERP",
-                                score=d_open.score,
-                                reason=f"{d_open.reason}_test_force_entry_once_short_only",
-                            )
-                            test_force_entry_once_available = False
-                            persist_test_harness_state()
-                            logger.warning(
-                                "[TEST_FORCE_ENTRY] "
-                                f"used=True coin={b_snap.coin} forced_side=SHORT_PERP "
-                                f"trigger=funding_rate_positive_eps raw_funding={b_snap.fundingRate:+.10f} "
-                                f"eps={TEST_FORCE_FUNDING_POS_EPS:.10f} "
-                                "bypassed_thresholds=[PREM_ENTRY,FUND_ENTRY,PREMIUM_SIGN]"
-                            )
                         if (
                             test_force_entry_once_available
                             and d_open.action == "HOLD"
@@ -888,11 +975,11 @@ def main() -> None:
                                 )
                                 continue
 
-                            if live_enabled and d_open.side == "LONG_PERP":
+                            if d_open.side == "LONG_PERP":
                                 missed_open_opportunity_cycles[b_snap.coin] = 0
                                 logger.warning(
                                     f"[{now_iso(b_snap.time)}] [{b_snap.coin}] HOLD | "
-                                    "UNSUPPORTED_BRANCH long_perp_short_spot_requires_spot_borrow"
+                                    "long_carry_disabled_one_sided_mode"
                                 )
                                 continue
 
@@ -908,6 +995,7 @@ def main() -> None:
 
                             missed_open_opportunity_cycles[b_snap.coin] += 1
                             plan = live.preview(b_snap, "OPEN", d_open.side, d_open.reason)
+                            next_funding_for_arm = compute_next_funding_ms(b_snap.time, FUNDING_INTERVAL_SECONDS)
 
                             if live_enabled:
                                 result = live.execute(plan)
@@ -938,21 +1026,92 @@ def main() -> None:
                                     logger.error("EXECUTION_DESYNC_ABORT | live trading disabled until restart")
                                     continue
                                 last_trade_ms[b_snap.coin] = b_snap.time
+                                # Atomically arm state after both live legs are confirmed.
+                                perp_qty = safe_float(getattr(result, "perp_qty", None))
+                                spot_qty = safe_float(getattr(result, "spot_qty", None))
+                                perp_result = getattr(result, "perp_result", None)
+                                after_pos = getattr(perp_result, "after_position", None) if perp_result is not None else None
+                                entry_px = None
+                                if isinstance(after_pos, dict):
+                                    entry_px = safe_float(after_pos.get("entry_px"))
+                                    if perp_qty is None:
+                                        perp_qty = abs(safe_float(after_pos.get("szi")) or 0.0)
 
-                            status = executor.on_decision(b_snap, d_open)
-                            if status.startswith("OPENED"):
-                                missed_open_opportunity_cycles[b_snap.coin] = 0
-                                pending_funding_validation[b_snap.coin] = {
-                                    "side": d_open.side,
-                                    "opened_at_ms": b_snap.time,
-                                    "next_funding_ms": compute_next_funding_ms(b_snap.time, FUNDING_INTERVAL_SECONDS),
-                                }
-                                logger.info(
-                                    "[POST_FUNDING_VALIDATION_ARMED] "
-                                    f"coin={b_snap.coin} side={d_open.side} "
-                                    f"opened_at={now_iso(b_snap.time)} "
-                                    f"next_funding_time={now_iso(int(pending_funding_validation[b_snap.coin]['next_funding_ms']))}"
+                                arm_state = PositionState(
+                                    coin=b_snap.coin,
+                                    side=d_open.side,
+                                    is_open=True,
+                                    opened_at_ms=int(b_snap.time),
+                                    size=perp_qty,
+                                    entry_px=entry_px,
+                                    branch="SHORT_CARRY" if d_open.side == "SHORT_PERP" else "LONG_CARRY",
+                                    spot_pair=getattr(result, "spot_pair", None),
+                                    spot_oid=getattr(result, "spot_oid", None),
+                                    perp_oid=getattr(result, "perp_oid", None),
+                                    spot_qty=spot_qty,
+                                    perp_qty=perp_qty,
+                                    expected_next_funding_ms=int(next_funding_for_arm),
+                                    post_validate_delay_sec=POST_FUNDING_VALIDATE_DELAY_SECONDS,
+                                    validator_armed=True,
                                 )
+                                try:
+                                    save_position_or_raise(arm_state)
+                                    executor.position = arm_state
+                                    logger.info(
+                                        "[STATE_ARM] success "
+                                        f"coin={b_snap.coin} side={d_open.side} "
+                                        f"expected_next_funding={now_iso(int(next_funding_for_arm))} "
+                                        f"spot_oid={arm_state.spot_oid} perp_oid={arm_state.perp_oid}"
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        "[STATE_ARM] fail "
+                                        f"coin={b_snap.coin} side={d_open.side} err={e!r} "
+                                        "action=CLOSE_ALL+DISABLE_LIVE"
+                                    )
+                                    close_plan = live.preview(
+                                        b_snap,
+                                        "CLOSE",
+                                        d_open.side,
+                                        "state_arm_failed_fail_closed",
+                                    )
+                                    close_result = live.execute(close_plan)
+                                    if not close_result or not getattr(close_result, "ok", False) or not getattr(close_result, "verified", False):
+                                        logger.error(
+                                            "STATE_ARM_FAIL_CLOSED_FAILED | "
+                                            f"coin={b_snap.coin} ok={getattr(close_result, 'ok', None)} "
+                                            f"verified={getattr(close_result, 'verified', None)} "
+                                            f"reason={getattr(close_result, 'verify_reason', None)}"
+                                        )
+                                    else:
+                                        logger.error(f"STATE_ARM_FAIL_CLOSED_OK | coin={b_snap.coin}")
+                                    executor.position = None
+                                    try:
+                                        save_position_or_raise(None)
+                                    except Exception as e2:
+                                        logger.error(f"[STATE_ARM] fail action=flat_reset_after_arm_fail err={e2!r}")
+                                    live_enabled = False
+                                    logger.error("EXECUTION_DESYNC_ABORT | live trading disabled until restart")
+                                    continue
+                            else:
+                                status = executor.on_decision(b_snap, d_open)
+
+                            status = (
+                                f"OPENED | coin={b_snap.coin} side={d_open.side} "
+                                f"premium={b_snap.premium:+.6f} funding={b_snap.fundingRate:+.6f}"
+                            )
+                            missed_open_opportunity_cycles[b_snap.coin] = 0
+                            pending_funding_validation[b_snap.coin] = {
+                                "side": d_open.side,
+                                "opened_at_ms": b_snap.time,
+                                "next_funding_ms": int(next_funding_for_arm),
+                            }
+                            logger.info(
+                                "[POST_FUNDING_VALIDATION_ARMED] "
+                                f"coin={b_snap.coin} side={d_open.side} "
+                                f"opened_at={now_iso(b_snap.time)} "
+                                f"next_funding_time={now_iso(int(pending_funding_validation[b_snap.coin]['next_funding_ms']))}"
+                            )
                             logger.info(f"[{now_iso(b_snap.time)}] [{b_snap.coin}] OPEN | {status}")
 
                         else:

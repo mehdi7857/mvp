@@ -38,5 +38,15 @@ class PositionState:
     # optional (for sync/diagnostics)
     size: Optional[float] = None
     entry_px: Optional[float] = None
+    # optional (for hedge arming / post-funding validation)
+    branch: Optional[str] = None
+    spot_pair: Optional[str] = None
+    spot_oid: Optional[str] = None
+    perp_oid: Optional[str] = None
+    spot_qty: Optional[float] = None
+    perp_qty: Optional[float] = None
+    expected_next_funding_ms: Optional[int] = None
+    post_validate_delay_sec: Optional[int] = None
+    validator_armed: Optional[bool] = None
 
 

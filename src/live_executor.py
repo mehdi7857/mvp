@@ -211,7 +211,22 @@ class LiveExecutor:
                     except Exception as rollback_err:
                         logger.error(f"HEDGE_ROLLBACK_FAIL | spot unwind failed | err={rollback_err!r}")
                     return perp
-                return perp
+                return SimpleNamespace(
+                    ok=True,
+                    verified=True,
+                    verify_reason="opened_hedge_legs",
+                    perp_result=perp,
+                    spot_result=spot,
+                    perp_oid=getattr(perp, "cloid", None),
+                    spot_oid=getattr(spot, "cloid", None),
+                    perp_qty=getattr(perp, "size", None),
+                    spot_qty=getattr(spot, "size", None),
+                    spot_pair=getattr(spot, "pair", None),
+                    raw={
+                        "perp": getattr(perp, "raw", {}),
+                        "spot": getattr(spot, "raw", {}),
+                    },
+                )
 
             # funding<0 carry (long perp + short spot) needs borrow/margin short, not supported in v1.
             return SimpleNamespace(

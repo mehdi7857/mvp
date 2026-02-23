@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import asdict
 from typing import Optional
 
@@ -28,12 +29,40 @@ def save_position(position: Optional[PositionState], path: str = DEFAULT_STATE_P
       {"position": {...PositionState fields...}}
     """
     try:
-        _ensure_parent_dir(path)
-        payload = {"position": None if position is None else asdict(position)}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        save_position_or_raise(position, path=path)
     except Exception as e:
         logger.error(f"Failed to save state to {path}: {type(e).__name__}: {e}")
+
+
+def save_position_or_raise(position: Optional[PositionState], path: str = DEFAULT_STATE_PATH) -> None:
+    """
+    Atomic + durable write:
+      1) write to temp file in same dir
+      2) flush + fsync
+      3) os.replace(temp, path)
+    """
+    _ensure_parent_dir(path)
+    payload = {"position": None if position is None else asdict(position)}
+    parent = os.path.dirname(path) or "."
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=parent, text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def load_position(path: str = DEFAULT_STATE_PATH) -> Optional[PositionState]:
