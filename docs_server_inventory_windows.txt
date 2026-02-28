@@ -1,0 +1,76 @@
+TOP_LEVEL
+
+Name                                      Mode  
+----                                      ----  
+.git                                      d--h--
+configs                                   d-----
+logs                                      d-----
+scripts                                   d-----
+src                                       d-----
+vector_bot                                d-----
+venv                                      d-----
+.gitignore                                -a----
+.venv.json                                -a----
+config.yaml                               -a----
+config.yaml.bak_                          -a----
+config.yaml.bak_forceonce_20260222_072524 -a----
+config.yaml.bak_option1_20260222_070502   -a----
+config.yaml.bak_restore_20260220_212212   -a----
+config.yaml.bak_safeedit_20260222_062020  -a----
+config.yaml.bak_test_                     -a----
+config.yaml.bak_test_20260222_060207      -a----
+fbb_apply_short_only.ps1                  -a----
+fbb_controlled_test.ps1                   -a----
+fbb_force_once_run.ps1                    -a----
+fbb_open_now.ps1                          -a----
+fbb_option1_monitor.ps1                   -a----
+fbb_restore_config.ps1                    -a----
+fbb_set_test_env.ps1                      -a----
+fbb_set_test_yaml_safe.ps1                -a----
+fbb_wait_post_and_cleanup.ps1             -a----
+query                                     -a----
+README.md                                 -a----
+service_err-20260218T183845.887.log       -a----
+service_err.log                           -a----
+service_out.log                           -a----
+stop                                      -a----
+SCRIPTS
+close_hedge_both.py                             
+fbb_close_both.py                               
+healthcheck_hl_api.py                           
+hl_snapshot_state.py                            
+journal_daily.ps1                               
+journal_monthly.ps1                             
+journal_weekly.ps1                              
+manual_rehedge_now.py                           
+rebalance_equal.py                              
+set_safe_profile.ps1                            
+test_hl_spot_hedge_feasibility.py               
+SRC
+account_report.py                               
+config.py                                       
+data.py                                         
+debug_ctx.py                                    
+exchanges.py                                    
+executor.py                                     
+force_close.py                                  
+funding_report.py                               
+hedge_preflight.py                              
+hl_keys.py                                      
+hyperliquid_client.py                           
+hyperliquid_trade_client.py                     
+journal.py                                      
+live_executor.py                                
+logger.py                                       
+logging_setup.py                                
+main.py                                         
+models.py                                       
+MVP.code-workspace                              
+report_funding_3w.py                            
+risk.py                                         
+rotate.py                                       
+state.py                                        
+strategy.py                                     
+universe.py                                     
+
+
